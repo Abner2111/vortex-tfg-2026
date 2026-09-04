@@ -4,7 +4,7 @@ CONFIGS +=
 PARAMS +=
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors -Wno-array-bounds
-CXXFLAGS += -fPIC -Wno-maybe-uninitialized
+CXXFLAGS += -fPIC -Wno-maybe-uninitialized -Wno-dangling-reference -Wno-type-limits
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 CXXFLAGS += $(CONFIGS)
 

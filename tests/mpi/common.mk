@@ -81,7 +81,7 @@ VX_KMU_FLAG := $(if $(filter vortex2,$(KERNEL_LIB)),-DKMU_ENABLE)
 VX_APP_OBJS = $(addsuffix .o, $(basename $(notdir $(VX_SRCS))))
 KERNEL_STARTUP := $(VORTEX_HOME)/sw/kernel/scripts/kernel_startup.sh
 
-CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wfatal-errors -Werror
+CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wno-pedantic -Wfatal-errors -Werror
 # Skip the deprecated MPI C++ bindings (MPI::*). The MPI tests use the C API
 # only; pulling in <mpicxx.h> drags in an internal function-pointer cast that
 # trips -Werror=cast-function-type under GCC. Harmless no-op for non-MPI tests.

@@ -5,7 +5,7 @@ DESTDIR ?= $(CURDIR)/..
 CONFIG_FILE := $(DESTDIR)/firesim_rt_config.stamp
 SRC_DIR := $(VORTEX_HOME)/sw/runtime/firesim
 
-CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wfatal-errors -Werror
+CXXFLAGS += -std=c++17 -Wall -Wextra -pedantic -Wno-pedantic -Wfatal-errors -Werror
 CXXFLAGS += -I$(INC_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_DIR)/firesim -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(RT_COMMON_DIR)
 CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
 

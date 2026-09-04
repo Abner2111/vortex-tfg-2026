@@ -129,6 +129,12 @@ python3 ci/roofline.py --app=sgemm --driver=simx --args="-n128" --flops=4194304 
   --cores=1 --warps=4 --threads=8 --issue-width=2 --plot --output=sgemm_roofline.png
 ```
 
+`ci/roofline_suite.py` runs the four NN-kernel regression benchmarks — `sgemm` (matmul), `conv3` (convolution), `softmax`, `relu` — once each under one shared hardware config and plots all four points on a single roofline, for a system-level compute-vs-memory-bound view:
+
+```bash
+python3 ci/roofline_suite.py --driver=simx --threads=8 --warps=4 --output=system_roofline.png
+```
+
 ---
 
 ## 5. Design & Architecture Rules
