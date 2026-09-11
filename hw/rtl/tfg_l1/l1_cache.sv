@@ -1,9 +1,4 @@
-// TFG: jerarquía de memoria L1+L2 con coherencia MESI (derivado del TFG de
-// Chacón Alfaro). Placeholder de l1_cache.sv (A-5) — estructura y puertos
-// definidos, lógica interna pendiente. Cada bloque TODO es una actividad
-// de A-5 en el anteproyecto.
-//
-// Interfaces (A-4):
+// Interfaces:
 //   core_bus_if  : L1 <-> pipeline.  Reutiliza VX_mem_bus_if de Vortex
 //                  (hw/rtl/mem/VX_mem_bus_if.sv) — mismo protocolo que el
 //                  core ya habla en el punto de bypass del dcache
@@ -116,13 +111,12 @@ module l1_cache import VX_gpu_pkg::*; #(
             end
             if (state == S_MISS_WAIT && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
                 // fill: la línea que llega de mem_bus_if reemplaza a la víctima.
-                // TODO (write-back): si tag_array[req_set_r][victim_way].dirty
-                // ya estaba en 1 acá, esos datos se pierden — falta volcarlos
-                // a mem_bus_if antes de este punto. Ver TODO de write-back.
-                tag_array[req_set_r][victim_way].valid <= 1'b1;
-                tag_array[req_set_r][victim_way].dirty <= req_rw_r;
-                tag_array[req_set_r][victim_way].mesi  <= req_rw_r ? 2'b11 : 2'b10; // M : E
-                tag_array[req_set_r][victim_way].tag   <= req_tag_r;
+                // Si estaba dirty, S_WB ya la volcó a mem_bus_if antes de
+                // llegar acá (ver arriba) — para este punto es seguro pisarla.
+                tag_array[req_set_r][victim_way_r].valid <= 1'b1;
+                tag_array[req_set_r][victim_way_r].dirty <= req_rw_r;
+                tag_array[req_set_r][victim_way_r].mesi  <= req_rw_r ? 2'b11 : 2'b10; // M : E
+                tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
             end
         end
     end
@@ -151,13 +145,22 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [LINE_BITS-1:0]  data_wr_data [NUM_WAYS];
     logic [LINE_BITS-1:0]  data_rd_data [NUM_WAYS];
 
+    // Mientras la FSM está ocupada (S_HIT/S_WB/S_MISS_WAIT/S_FILL), el bus
+    // core_bus_if puede seguir cambiando de dirección sin que nos demos
+    // cuenta (req_valid ya bajó, el resto del bus no está garantizado
+    // estable) — si el read siguiera indexando por el `req_set` vivo,
+    // data_rd_data se corrompería a mitad de un miss largo. Fuera de
+    // S_IDLE, releer siempre el mismo set con el que se aceptó la
+    // petición (req_set_r, congelado).
+    wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? req_set : req_set_r;
+
     for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
         logic [LINE_BITS-1:0] mem [NUM_SETS];
 
         always_ff @(posedge clk) begin
             if (data_wr_en[w])
                 mem[data_wr_set[w]] <= data_wr_data[w];
-            data_rd_data[w] <= mem[req_set];
+            data_rd_data[w] <= mem[array_set_addr];
         end
     end
 
@@ -177,18 +180,22 @@ module l1_cache import VX_gpu_pkg::*; #(
     //
     //   S_IDLE      -> acepta petición nueva; tag_hit ya es combinacional
     //                  este mismo ciclo (ver tag array), así que decide
-    //                  S_HIT o S_MISS_WAIT al vuelo.
+    //                  S_HIT, S_WB o S_MISS_WAIT al vuelo (si hay miss y
+    //                  la vía víctima está dirty, hay que sacarla primero).
+    //   S_WB        -> vuelca la línea víctima (dirty) a mem_bus_if antes
+    //                  de pedir la línea nueva — si no, esos datos se
+    //                  pierden sin más. Solo se visita si victim_dirty.
     //   S_HIT       -> data_rd_data[hit_way_r] ya está listo (el read
     //                  síncrono del data array arrancó en S_IDLE). Sirve
     //                  la palabra pedida, o la mezcla con req_wdata_r si
     //                  era un write.
-    //   S_MISS_WAIT -> pide la línea completa a mem_bus_if (una sola
-    //                  transacción: mem_bus_if.DATA_SIZE = LINE_SIZE).
+    //   S_MISS_WAIT -> pide la línea nueva completa a mem_bus_if (una
+    //                  sola transacción: mem_bus_if.DATA_SIZE = LINE_SIZE).
     //   S_FILL      -> con la línea ya en mem_bus_if.rsp_data, la mezcla
     //                  con req_wdata_r si el miss era un write
     //                  (write-allocate) y la sirve.
     // ------------------------------------------------------------------
-    typedef enum logic [1:0] { S_IDLE, S_HIT, S_MISS_WAIT, S_FILL } state_t;
+    typedef enum logic [2:0] { S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL } state_t;
     state_t state;
 
     // petición latcheada al aceptarla en S_IDLE
@@ -202,6 +209,12 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [CORE_TAG_WIDTH-1:0] req_ctag_r;
     logic                     mem_req_sent_r;
     logic [LINE_BITS-1:0]     fetched_line_r;  // línea recién llegada de mem_bus_if, para usar en S_FILL
+
+    // vía víctima y su tag, congelados en S_IDLE — todo lo de abajo usa
+    // estos registros, nunca `victim_way`/`tag_array[...].tag` en vivo
+    // (que siguen al `req_set` vivo y ya no valen fuera de S_IDLE).
+    logic [WAY_BITS-1:0]      victim_way_r;
+    logic [TAG_BITS-1:0]      victim_tag_r;
 
     assign core_bus_if.req_ready = (state == S_IDLE);
 
@@ -221,12 +234,28 @@ module l1_cache import VX_gpu_pkg::*; #(
                         req_wdata_r  <= core_bus_if.req_data.data;
                         req_byteen_r <= core_bus_if.req_data.byteen;
                         req_ctag_r   <= core_bus_if.req_data.tag;
-                        state        <= tag_hit ? S_HIT : S_MISS_WAIT;
+                        victim_way_r <= victim_way;
+                        victim_tag_r <= tag_array[req_set][victim_way].tag;
+                        if (tag_hit)
+                            state <= S_HIT;
+                        else if (tag_array[req_set][victim_way].valid
+                                  && tag_array[req_set][victim_way].dirty)
+                            state <= S_WB;          // hay que desalojar algo sucio primero
+                        else
+                            state <= S_MISS_WAIT;   // vía libre o ya limpia, directo al refill
                     end
                 end
                 S_HIT: begin
                     if (core_bus_if.rsp_ready)
                         state <= S_IDLE;
+                end
+                S_WB: begin
+                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                        mem_req_sent_r <= 1'b1;
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        mem_req_sent_r <= 1'b0;
+                        state          <= S_MISS_WAIT;  // ahora sí, pedir la línea nueva
+                    end
                 end
                 S_MISS_WAIT: begin
                     if (mem_bus_if.req_valid && mem_bus_if.req_ready)
@@ -246,20 +275,23 @@ module l1_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    // ---- puerto hacia mem_bus_if (solo activo en S_MISS_WAIT) ----
+    // ---- puerto hacia mem_bus_if (activo en S_WB y en S_MISS_WAIT) ----
     // dirección de línea: mem_bus_if.DATA_SIZE = LINE_SIZE, así que su
     // ADDR_WIDTH ya excluye los bits de offset dentro de línea — {tag,set}
-    // es exactamente esa dirección.
-    assign mem_bus_if.req_valid       = (state == S_MISS_WAIT) && !mem_req_sent_r;
-    assign mem_bus_if.req_data.rw     = 1'b0;               // el refill siempre lee
-    assign mem_bus_if.req_data.addr   = {req_tag_r, req_set_r};
-    assign mem_bus_if.req_data.data   = '0;
+    // es exactamente esa dirección. En S_WB es la dirección VIEJA (la
+    // víctima, {victim_tag_r,req_set_r}); en S_MISS_WAIT es la NUEVA
+    // ({req_tag_r,req_set_r}) — mismo set, tag distinto.
+    assign mem_bus_if.req_valid       = (state == S_WB || state == S_MISS_WAIT) && !mem_req_sent_r;
+    assign mem_bus_if.req_data.rw     = (state == S_WB);   // write-back escribe; el refill lee
+    assign mem_bus_if.req_data.addr   = (state == S_WB) ? {victim_tag_r, req_set_r}
+                                                          : {req_tag_r, req_set_r};
+    assign mem_bus_if.req_data.data   = data_rd_data[victim_way_r];  // solo se usa en S_WB
     assign mem_bus_if.req_data.byteen = '1;
     assign mem_bus_if.req_data.attr   = '0;
     // TODO: con más de un miss en vuelo hace falta un tag real acá para
     // no confundir respuestas — con una sola petición a la vez alcanza con 0.
     assign mem_bus_if.req_data.tag    = '0;
-    assign mem_bus_if.rsp_ready       = (state == S_MISS_WAIT);
+    assign mem_bus_if.rsp_ready       = (state == S_WB || state == S_MISS_WAIT);
 
     // ---- merge de escritura (write-hit o write-allocate en un miss) ----
     // reemplaza, dentro de la línea, solo la palabra en req_off_r según
@@ -297,7 +329,7 @@ module l1_cache import VX_gpu_pkg::*; #(
             fsm_data_wr_en = 1'b1;              // write-hit: guarda la línea mezclada
         end else if (state == S_MISS_WAIT && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
             fsm_data_wr_en   = 1'b1;            // fill: guarda la línea (mezclada si era write)
-            fsm_data_wr_way  = victim_way;
+            fsm_data_wr_way  = victim_way_r;
             fsm_data_wr_line = req_rw_r ? fill_line_new : fill_line_old;
         end
     end
@@ -325,10 +357,17 @@ module l1_cache import VX_gpu_pkg::*; #(
 
 
     // ------------------------------------------------------------------
-    // TODO (A-5): Write-back
-    //   - reemplazo de línea dirty (M): volcar a mem_bus_if antes del refill
-    //   - snoop de invalidación sobre línea M (snoop_bus_if): volcar y
-    //     transicionar a I, entregar los datos si el snoop pide compartir
+    // Write-back
+    //   Reemplazo de línea dirty (M) en un miss: resuelto con el estado
+    //   S_WB de arriba (S_IDLE -> S_WB -> S_MISS_WAIT cuando la vía
+    //   víctima está valid+dirty). Vuelca data_rd_data[victim_way_r] a
+    //   {victim_tag_r,req_set_r} antes de pedir la línea nueva.
+    //
+    //   TODO (coherencia, fuera de este alcance): write-back disparado por
+    //   un snoop de invalidación sobre una línea M (snoop_bus_if) — ese es
+    //   un tercer disparador de write-back además del miss local, y
+    //   necesita su propio camino porque puede llegar mientras la FSM ya
+    //   está ocupada con otra cosa.
     // ------------------------------------------------------------------
 
 
