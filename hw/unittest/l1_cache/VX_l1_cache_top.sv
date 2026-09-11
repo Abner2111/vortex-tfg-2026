@@ -4,9 +4,15 @@
 // hw/unittest/cache/VX_cache_top.sv usa para VX_cache_cluster.
 
 module VX_l1_cache_top import VX_gpu_pkg::*; #(
-    parameter CACHE_SIZE     = 4096,
-    parameter LINE_SIZE      = 64,
-    parameter NUM_WAYS       = 4,
+    // Parámetros achicados solo para este testbench aislado (2 palabras
+    // por línea, 2 vías, 2 sets): con LINE_BITS=64 el bus de memoria
+    // queda escalar del lado de main.cpp (más fácil de manejar), sin
+    // cambiar los defaults reales de l1_cache.sv (4096/64/4/4), que son
+    // los que importan para síntesis. LINE_SIZE == WORD_SIZE colapsaría
+    // OFFSET_BITS a 0 (ancho negativo inválido en SV), por eso 2 palabras.
+    parameter CACHE_SIZE     = 32,
+    parameter LINE_SIZE      = 8,
+    parameter NUM_WAYS       = 2,
     parameter WORD_SIZE      = 4,
     parameter CORE_TAG_WIDTH = 8,
     parameter MEM_TAG_WIDTH  = 8,
