@@ -1,0 +1,10 @@
+`verilator_config
+
+// l1_cache.sv es un placeholder (A-5): todavía no lee los campos de
+// VX_mem_bus_if/VX_snoop_bus_if que va a necesitar una vez implementada la
+// lógica real. Waivers scoped a este proyecto únicamente — no toca el
+// build de ningún otro target (VX_mem_bus_if.sv es compartido por todo
+// Vortex, así que no se le agregan pragmas inline). Borrar a medida que
+// cada TODO de l1_cache.sv se implemente y los campos se empiecen a usar.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
+lint_off -rule UNDRIVEN     -file "*/hw/rtl/tfg_l1/VX_snoop_bus_if.sv"
