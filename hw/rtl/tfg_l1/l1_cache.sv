@@ -10,6 +10,11 @@
 //   snoop_mst_if : L1 -> snoop bus. Mismo VX_snoop_bus_if.sv, modport
 //                  master (A-7): la consulta PROPIA de este L1 en un miss
 //                  local o un upgrade S->M — ver S_SNOOP_QUERY más abajo.
+//
+// A-8: el módulo tiene DOS máquinas de estado independientes, `state`
+// (camino local: pipeline <-> L1 <-> L2) y `snp_state` (camino remoto:
+// responder consultas de otros L1) — ver el comentario grande antes de
+// `state_t` para el porqué y qué se comparte entre las dos.
 
 `include "VX_define.vh"
 
@@ -36,7 +41,7 @@ module l1_cache import VX_gpu_pkg::*; #(
 );
 
     // ------------------------------------------------------------------
-    // Tag array 
+    // Tag array
     //   NUM_WAYS vías por set, cada línea: {valid, dirty, mesi, tag}.
     //   Descompone core_bus_if.req_data.addr (dirección de palabra, ver
     //   VX_mem_bus_if.sv: ADDR_WIDTH = MEM_ADDR_WIDTH - CLOG2(DATA_SIZE))
@@ -108,14 +113,6 @@ module l1_cache import VX_gpu_pkg::*; #(
         .valid_out (snoop_tag_hit)
     );
 
-    // ¿esta petición de snoop le toca a este L1 y hace falta hacer algo?
-    // (bloquea aceptar una petición local nueva ese mismo ciclo — ver
-    // core_bus_if.req_ready más abajo)
-    wire snoop_any_hit = snoop_bus_if.snoop_valid && snoop_tag_hit;
-    // ¿hace falta flush (línea en M) antes de poder responder?
-    wire snoop_flush_needed = snoop_any_hit
-                            && (tag_array[snoop_set][snoop_hit_way].mesi == 2'b11);
-
     // Vía víctima para un miss: la primera invalida del set; si todas
     // están ocupadas, cae en la vía 0. Placeholder de reemplazo real —
     // no es LRU/PLRU, es "vía 0 siempre" en el caso de set lleno.
@@ -130,31 +127,34 @@ module l1_cache import VX_gpu_pkg::*; #(
 
     // invalidar todas las líneas en reset. El resto de los writes (fill
     // tras un miss, marcar dirty en un write-hit, transiciones MESI por
-    // snoop remoto) los maneja la FSM de hit/miss y el lado snooper (A-6)
-    // más abajo, en este mismo always_ff para no tener dos procesos
-    // manejando tag_array (dos always_ff separados escribiendo la misma
-    // variable no es válido en SV/no sintetiza).
+    // snoop remoto) los maneja la FSM local (`state`) y la de snoop
+    // (`snp_state`) más abajo, en este mismo always_ff para no tener dos
+    // procesos manejando tag_array (dos always_ff separados escribiendo la
+    // misma variable no es válido en SV/no sintetiza, aunque en la
+    // práctica casi siempre toquen entradas distintas — ver el comentario
+    // de "condición de carrera residual" junto a S_IDLE más abajo).
     always_ff @(posedge clk) begin
         if (reset) begin
             for (int s = 0; s < NUM_SETS; ++s)
                 for (int w = 0; w < NUM_WAYS; ++w)
                     tag_array[s][w].valid <= 1'b0;
         end else begin
+            // ---- lado local (state) ----
             if (state == S_IDLE && core_bus_if.req_valid && core_bus_if.req_ready
                 && tag_hit && core_bus_if.req_data.rw
                 && tag_array[req_set][hit_way].mesi != 2'b01) begin
                 // write-hit sobre E o M: upgrade silencioso, sin tráfico de
                 // bus (nadie más puede tenerla en E, y si está en M ya es
                 // exclusiva). Si está en S, hace falta invalidar a los
-                // demás primero ( ver S_SNOOP_QUERY (is_upgrade_r)).
+                // demás primero (ver S_SNOOP_QUERY / is_upgrade_r).
                 tag_array[req_set][hit_way].dirty <= 1'b1;
                 tag_array[req_set][hit_way].mesi  <= 2'b11;  // MESI_M
             end
             if (state == S_SNOOP_QUERY && is_upgrade_r
                 && snoop_mst_if.snoop_valid && snoop_mst_if.snoop_ready) begin
-                // upgrade S->M: la consulta de invalidación ya se
-                // propagó y todos respondieron. Hasta ahora es seguro
-                // marcarla M (ver S_IDLE, más arriba, que se abstuvo).
+                // upgrade S->M: la consulta de invalidación ya se propagó
+                // y todos respondieron. Recién ahora es seguro marcarla M
+                // (ver S_IDLE, más arriba, que se abstuvo).
                 tag_array[req_set_r][hit_way_r].dirty <= 1'b1;
                 tag_array[req_set_r][hit_way_r].mesi  <= 2'b11;
             end
@@ -172,22 +172,22 @@ module l1_cache import VX_gpu_pkg::*; #(
                                                             : (remote_hit_r ? 2'b01 : 2'b10); // M : S : E
                 tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
             end
-            // ---- lado snooper
-            if (state == S_IDLE && snoop_bus_if.snoop_valid && snoop_tag_hit
+            // ---- lado snoop (snp_state), independiente del local (A-8) ----
+            if (snp_state == SNP_IDLE && snoop_bus_if.snoop_valid && snoop_tag_hit
                 && tag_array[snoop_set][snoop_hit_way].mesi != 2'b11) begin
-                // E o S (si estuviera en M, el flush se hace en S_SNOOP_WB/
-                // S_SNOOP_POST_WB más abajo, acá no se toca todavía).
+                // E o S (si estuviera en M, el flush se hace en SNP_WB/
+                // SNP_POST_WB más abajo, acá no se toca todavía).
                 if (snoop_bus_if.snoop_rw)
                     tag_array[snoop_set][snoop_hit_way].valid <= 1'b0;        // E->I, S->I
                 else
                     tag_array[snoop_set][snoop_hit_way].mesi  <= 2'b01;      // E->S (S sigue S)
             end
-            if (state == S_SNOOP_WB && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+            if (snp_state == SNP_WB && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
                 // flush completo: M -> E (limpia, todavía exclusiva un instante)
                 tag_array[snoop_set_r][snoop_way_r].dirty <= 1'b0;
                 tag_array[snoop_set_r][snoop_way_r].mesi  <= 2'b10;  // E
             end
-            if (state == S_SNOOP_POST_WB) begin
+            if (snp_state == SNP_POST_WB) begin
                 // segundo paso: E->I si el remoto quería escribir, E->S si quería leer
                 if (snoop_rw_r)
                     tag_array[snoop_set_r][snoop_way_r].valid <= 1'b0;
@@ -206,13 +206,24 @@ module l1_cache import VX_gpu_pkg::*; #(
     //   mayoría de sintetizadores (Vivado/Yosys), solo LUTRAM o FFs.
     //   Confirmar la inferencia real en A-12.
     //
-    //   data_wr_* lo maneja el hit/miss (fill-on-miss, write hit);
-    //   acá solo se expone el puerto.
+    //   data_wr_* lo maneja el hit/miss local (fill-on-miss, write hit) —
+    //   el lado snoop NUNCA escribe el data array, solo lo lee para poder
+    //   flushear una línea M (ver snoop_rd_data más abajo).
     //
     //   OJO — pendiente para el hit/miss: data_rd_data queda 1
     //   ciclo detrás de req_set/hit_way (por el read síncrono), así que
     //   hit_way hay que registrarlo un ciclo antes de indexar
     //   data_rd_data con él, si no, apunta a la vía equivocada.
+    //
+    //   A-8: dos puertos de lectura independientes (uno para `state`, uno
+    //   para `snp_state`), no uno solo arbitrado entre los dos. Antes de
+    //   separar las FSM esto no hacía falta (una sola llevaba la cuenta a
+    //   la vez); con las dos corriendo en paralelo, si compartieran un
+    //   único puerto y alguna tuviera que "cederlo" un ciclo mientras la
+    //   otra sigue con un S_WB/SNP_WB en curso, data_rd_data/snoop_rd_data
+    //   se corromperían igual que describe el OJO de arriba. BRAMs reales
+    //   (Xilinx, Yosys) soportan 2 puertos de lectura (o 1R+1W) de forma
+    //   nativa — no es un costo extra inventado para esquivar el problema.
     // ------------------------------------------------------------------
     localparam LINE_BITS = LINE_SIZE * 8;
 
@@ -220,23 +231,20 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [SET_BITS-1:0]   data_wr_set  [NUM_WAYS];
     logic [LINE_BITS-1:0]  data_wr_data [NUM_WAYS];
     logic [LINE_BITS-1:0]  data_rd_data [NUM_WAYS];
+    logic [LINE_BITS-1:0]  snoop_rd_data [NUM_WAYS];
 
-    // Mientras la FSM está ocupada (S_HIT/S_WB/S_MISS_WAIT/S_FILL), el bus
-    // core_bus_if puede seguir cambiando de dirección sin que nos demos
-    // cuenta (req_valid ya bajó, el resto del bus no está garantizado
-    // estable) — si el read siguiera indexando por el `req_set` vivo,
-    // data_rd_data se corrompería a mitad de un miss largo. Fuera de
-    // S_IDLE, releer siempre el mismo set con el que se aceptó la
-    // petición (req_set_r, congelado).
-    // En S_IDLE, si hay un snoop con flush pendiente lo prioriza sobre una
-    // petición local nueva (mismo criterio que el always_ff de más abajo) —
-    // así data_rd_data[snoop_way_r] ya está listo un ciclo después, en
-    // S_SNOOP_WB, igual que hit_way_r/victim_way_r quedan listos para
-    // S_HIT/S_WB.
-    wire [SET_BITS-1:0] array_set_addr =
-        (state == S_IDLE)  ? (snoop_flush_needed ? snoop_set : req_set)
-      : (state == S_SNOOP_WB || state == S_SNOOP_POST_WB) ? snoop_set_r
-      : req_set_r;
+    // Mientras la FSM local está ocupada (S_HIT/S_WB/S_MISS_WAIT/S_FILL/
+    // S_SNOOP_QUERY), el bus core_bus_if puede seguir cambiando de
+    // dirección sin que nos demos cuenta (req_valid ya bajó, el resto del
+    // bus no está garantizado estable) — si el read siguiera indexando
+    // por el `req_set` vivo, data_rd_data se corrompería a mitad de un
+    // miss largo. Fuera de S_IDLE, releer siempre el mismo set con el que
+    // se aceptó la petición (req_set_r, congelado).
+    wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? req_set : req_set_r;
+
+    // Mismo criterio, pero para el camino de snoop: fuera de SNP_IDLE
+    // (es decir, durante SNP_WB/SNP_POST_WB) releer siempre snoop_set_r.
+    wire [SET_BITS-1:0] snoop_array_set_addr = (snp_state == SNP_IDLE) ? snoop_set : snoop_set_r;
 
     for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
         logic [LINE_BITS-1:0] mem [NUM_SETS];
@@ -244,12 +252,13 @@ module l1_cache import VX_gpu_pkg::*; #(
         always_ff @(posedge clk) begin
             if (data_wr_en[w])
                 mem[data_wr_set[w]] <= data_wr_data[w];
-            data_rd_data[w] <= mem[array_set_addr];
+            data_rd_data[w]  <= mem[array_set_addr];
+            snoop_rd_data[w] <= mem[snoop_array_set_addr];
         end
     end
 
-    // data_wr_en/set/data los maneja la FSM de hit/miss (fsm_data_wr_*
-    // más abajo) — un solo "ganador" por ciclo entre las NUM_WAYS vías.
+    // data_wr_en/set/data los maneja la FSM local (fsm_data_wr_* más
+    // abajo) — un solo "ganador" por ciclo entre las NUM_WAYS vías.
     for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_wr_decode
         assign data_wr_en[w]   = fsm_data_wr_en && (fsm_data_wr_way == w[WAY_BITS-1:0]);
         assign data_wr_set[w]  = fsm_data_wr_set;
@@ -258,14 +267,18 @@ module l1_cache import VX_gpu_pkg::*; #(
 
 
     // ------------------------------------------------------------------
-    // Lógica de hit/miss
-    //   FSM de una petición en vuelo a la vez (sin pipelining de misses
-    //   concurrentes — ver nota de mem_bus_if.req_data.tag más abajo).
+    // Lógica de hit/miss local (`state`)
+    //   FSM de una petición local en vuelo a la vez (sin pipelining de
+    //   misses concurrentes — ver nota de mem_bus_if.req_data.tag más
+    //   abajo). Totalmente independiente de `snp_state` (más abajo) desde
+    //   A-8 — ver el comentario grande antes de los dos typedef.
     //
     //   S_IDLE      -> acepta petición nueva; tag_hit ya es combinacional
     //                  este mismo ciclo (ver tag array), así que decide
-    //                  S_HIT, S_WB o S_MISS_WAIT al vuelo (si hay miss y
-    //                  la vía víctima está dirty, hay que sacarla primero).
+    //                  S_HIT, S_WB o S_SNOOP_QUERY al vuelo (si hay miss y
+    //                  la vía víctima está dirty, hay que sacarla primero;
+    //                  si es un write-hit sobre S, hace falta invalidar a
+    //                  los demás antes de subir a M).
     //   S_WB        -> vuelca la línea víctima (dirty) a mem_bus_if antes
     //                  de pedir la línea nueva — si no, esos datos se
     //                  pierden sin más. Solo se visita si victim_dirty.
@@ -273,60 +286,77 @@ module l1_cache import VX_gpu_pkg::*; #(
     //                  síncrono del data array arrancó en S_IDLE). Sirve
     //                  la palabra pedida, o la mezcla con req_wdata_r si
     //                  era un write.
+    //   S_SNOOP_QUERY -> (A-7) consulta propia por snoop_mst_if antes de:
+    //                  (a) un miss local (decide I->E si nadie más la
+    //                  tiene, I->S si alguien más la tiene, o directo I->M
+    //                  con invalidación si el miss era de escritura), o
+    //                  (b) un write-hit sobre una línea en S (necesita
+    //                  invalidar a los demás antes de subir a M — upgrade
+    //                  S->M). is_upgrade_r distingue el caso (b): al
+    //                  volver, (a) sigue a S_MISS_WAIT, (b) sigue a S_HIT
+    //                  (la línea ya está localmente).
     //   S_MISS_WAIT -> pide la línea nueva completa a mem_bus_if (una
     //                  sola transacción: mem_bus_if.DATA_SIZE = LINE_SIZE).
     //   S_FILL      -> con la línea ya en mem_bus_if.rsp_data, la mezcla
     //                  con req_wdata_r si el miss era un write
     //                  (write-allocate) y la sirve.
-    //   S_SNOOP_WB      -> otro L1 preguntó por una línea que tenemos
-    //                  en M: hay que volcarla a mem_bus_if antes de poder
-    //                  responder — mismo mecanismo que S_WB, pero
-    //                  disparado por un evento remoto, no un miss local.
-    //   S_SNOOP_POST_WB -> el flush ya terminó (M -> E, línea limpia). Acá
-    //                  se aplica el paso final: E -> S si el remoto quería
-    //                  leer, E -> I si quería escribir (ver tabla MESI en
-    //                  docs/proposals/tfg_mesi_coherence_design.md §2).
-    //   S_SNOOP_HIT     -> igual que S_HIT pero para un snoop que se
-    //                  resuelve sin flush (E o S): un ciclo "de reporte",
-    //                  usando snoop_resp_mesi_r/dirty_r -- capturados ANTES
-    //                  de la escritura E->S/E->I/S->I en S_IDLE, para no
-    //                  releer tag_array ya mutado en el mismo ciclo que se
-    //                  arma la respuesta (esa carrera hacía que a veces se
-    //                  reportara el estado post-transición en vez del que
-    //                  tenía la línea cuando llegó el snoop).
-    //   S_SNOOP_DONE    -> mismo motivo que S_SNOOP_HIT, pero para el path
-    //                  de flush: el ciclo en que S_SNOOP_POST_WB decide la
-    //                  escritura final no alcanza para reportar ready ese
-    //                  mismo ciclo (la escritura es un always_ff registrado,
-    //                  necesita un ciclo más para verse desde afuera) --
-    //                  S_SNOOP_DONE es ese ciclo siguiente, ya con la
-    //                  escritura confirmada.
-    //   S_SNOOP_QUERY   -> (A-7, lado master) consulta propia por
-    //                  snoop_mst_if antes de: (a) un miss local (decide
-    //                  I->E si nadie más la tiene, I->S si alguien más la
-    //                  tiene, o directo I->M con invalidación si el miss
-    //                  era de escritura), o (b) un write-hit sobre una
-    //                  línea en S (necesita invalidar a los demás antes de
-    //                  subir a M -- upgrade S->M). is_upgrade_r distingue
-    //                  el caso (b): al volver, (a) sigue a S_MISS_WAIT,
-    //                  (b) sigue a S_HIT (la línea ya está localmente).
-    //                  `ponytail:` mientras se espera acá, este L1 no
-    //                  puede atender un snoop remoto (esa lógica solo
-    //                  corre en S_IDLE) -- si dos L1 se consultan mutuamente
-    //                  al mismo tiempo, cada uno queda bloqueado esperando
-    //                  al otro (deadlock cruzado). No se da en los
-    //                  escenarios de prueba de A-7 (secuenciados, sin
-    //                  consultas simultáneas en ambos sentidos); si el TFG
-    //                  necesita robustecer esto, separar la FSM en dos
-    //                  (pedidos propios vs. responder snoops, cada una con
-    //                  su propio registro `state`) y arbitrar mem_bus_if
-    //                  entre ambas.
+    //
+    //   Condición de carrera residual (documentada, no resuelta en A-8):
+    //   si un snoop remoto y una petición local coinciden EXACTAMENTE en
+    //   la misma línea (mismo set y vía) en el mismo ciclo, las dos
+    //   escrituras a tag_array (una desde `state`, otra desde `snp_state`)
+    //   compiten dentro del mismo always_ff — la que está más abajo en el
+    //   código gana (last-write-wins). Es un caso de borde raro (necesita
+    //   colisión exacta de dirección, no solo de timing) y no es el
+    //   deadlock que A-8 pide resolver — ver docs/proposals/
+    //   tfg_mesi_coherence_design.md §9 para el análisis completo y por
+    //   qué se dejó fuera de esta pasada (arreglarlo bien necesita un
+    //   candado por línea al estilo MSHR, un cambio de otro tamaño).
     // ------------------------------------------------------------------
-    typedef enum logic [3:0] {
-        S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL,
-        S_SNOOP_WB, S_SNOOP_POST_WB, S_SNOOP_HIT, S_SNOOP_DONE, S_SNOOP_QUERY
+    typedef enum logic [2:0] {
+        S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL, S_SNOOP_QUERY
     } state_t;
     state_t state;
+
+    // ------------------------------------------------------------------
+    // Lógica de snoop (`snp_state`) — responde a eventos remotos.
+    //   Antes de A-8 esto vivía en el MISMO registro `state` que la FSM
+    //   local: mientras `state` estaba en S_SNOOP_QUERY (esperando su
+    //   propio turno del árbitro, A-7), este L1 no podía atender un snoop
+    //   entrante — si dos L1 se consultaban mutuamente al mismo tiempo,
+    //   cada uno quedaba bloqueado esperando al otro (deadlock cruzado,
+    //   documentado como límite conocido en A-7). A-8 lo resuelve
+    //   separando las dos FSM: `snp_state` corre en paralelo a `state`,
+    //   así que este L1 SIEMPRE puede responder un snoop remoto, incluso
+    //   en medio de su propio miss/upgrade.
+    //
+    //   Lo único que las dos FSM siguen compartiendo es mem_bus_if (un
+    //   solo puerto físico hacia la L2) — ver el árbitro `mem_owner_r`
+    //   más abajo, que las intercala cuando ambas lo necesitan al mismo
+    //   tiempo. tag_array también es compartido pero, salvo la carrera
+    //   residual documentada arriba, cada FSM toca entradas distintas.
+    //
+    //   SNP_IDLE     -> espera snoop_valid; si hace tag hit local, decide
+    //                  SNP_WB (línea en M, hay que flushear primero) o
+    //                  SNP_HIT (E/S, se resuelve sin flush).
+    //   SNP_WB       -> vuelca la línea a mem_bus_if (mismo mecanismo que
+    //                  S_WB, pero disparado por el evento remoto).
+    //   SNP_POST_WB  -> el flush ya terminó (M -> E). Acá se aplica el
+    //                  paso final: E -> S si el remoto quería leer, E -> I
+    //                  si quería escribir.
+    //   SNP_HIT      -> ciclo de "reporte" para E/S sin flush — igual
+    //                  que S_HIT, usa snoop_resp_mesi_r/dirty_r
+    //                  (capturados en SNP_IDLE, antes de la transición)
+    //                  para no releer tag_array ya mutado en el mismo
+    //                  ciclo que arma la respuesta.
+    //   SNP_DONE     -> mismo motivo que SNP_HIT, pero para el path de
+    //                  flush: la escritura final de SNP_POST_WB recién se
+    //                  ve desde afuera un ciclo después (registrada).
+    // ------------------------------------------------------------------
+    typedef enum logic [2:0] {
+        SNP_IDLE, SNP_WB, SNP_POST_WB, SNP_HIT, SNP_DONE
+    } snp_state_t;
+    snp_state_t snp_state;
 
     // petición latcheada al aceptarla en S_IDLE
     logic                     req_rw_r;
@@ -337,7 +367,7 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [WORD_SIZE*8-1:0]   req_wdata_r;
     logic [WORD_SIZE-1:0]     req_byteen_r;
     logic [CORE_TAG_WIDTH-1:0] req_ctag_r;
-    logic                     mem_req_sent_r;
+    logic                     mem_req_sent_core_r;
     logic [LINE_BITS-1:0]     fetched_line_r;  // línea recién llegada de mem_bus_if, para usar en S_FILL
 
     // vía víctima y su tag, congelados en S_IDLE — todo lo de abajo usa
@@ -346,67 +376,44 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [WAY_BITS-1:0]      victim_way_r;
     logic [TAG_BITS-1:0]      victim_tag_r;
 
-    // snoop remoto latcheado al entrar a S_SNOOP_WB (mismo criterio que los
-    // registros de arriba para un miss local: todo lo que S_SNOOP_WB/
-    // S_SNOOP_POST_WB necesitan se congela acá, nunca se relee snoop_bus_if
-    // en vivo fuera de S_IDLE — la petición remota no está garantizada
+    // snoop remoto latcheado al entrar a SNP_WB (mismo criterio que los
+    // registros de arriba para un miss local: todo lo que SNP_WB/
+    // SNP_POST_WB necesitan se congela acá, nunca se relee snoop_bus_if
+    // en vivo fuera de SNP_IDLE — la petición remota no está garantizada
     // estable más allá de ese ciclo).
     logic [SET_BITS-1:0]      snoop_set_r;
     logic [WAY_BITS-1:0]      snoop_way_r;
     logic [TAG_BITS-1:0]      snoop_tag_r;
     logic                     snoop_rw_r;
+    logic                     mem_req_sent_snoop_r;
 
     // snapshot del estado MESI/dirty de la línea ANTES de aplicar la
     // transición E->S/E->I/S->I -- lo que se le reporta al que preguntó en
-    // S_SNOOP_HIT (ver comentario de S_SNOOP_HIT más arriba).
+    // SNP_HIT (ver comentario de SNP_HIT más arriba).
     logic [1:0]                snoop_resp_mesi_r;
     logic                      snoop_resp_dirty_r;
 
     // resultado de la consulta propia (S_SNOOP_QUERY): ¿algún otro L1
-    // tenía la línea? decide I->S vs. I->E al llenarla 
+    // tenía la línea? decide I->S vs. I->E al llenarla.
     // is_upgrade_r distingue un miss local (I->E/S/M) de un
     // upgrade sobre una línea ya presente en S (S->M) -- ver S_SNOOP_QUERY.
     logic                      remote_hit_r;
     logic                      is_upgrade_r;
 
-    // No acepta petición local nueva el ciclo en que hay que atender un
-    // snoop remoto  (hit local en el tag array). 
-    // Un miss de snoop (no le toca a este L1) no bloquea nada.
-    assign core_bus_if.req_ready = (state == S_IDLE) && !snoop_any_hit;
+    // Ya no depende de `snp_state`: con las dos FSM separadas, aceptar
+    // una petición local nueva no tiene por qué esperar a que termine de
+    // resolverse un snoop remoto (A-8) -- solo importa el propio `state`.
+    assign core_bus_if.req_ready = (state == S_IDLE);
 
+    // ---- FSM local ----
     always_ff @(posedge clk) begin
         if (reset) begin
-            state          <= S_IDLE;
-            mem_req_sent_r <= 1'b0;
+            state                <= S_IDLE;
+            mem_req_sent_core_r  <= 1'b0;
         end else begin
             case (state)
                 S_IDLE: begin
-                    if (snoop_bus_if.snoop_valid && snoop_tag_hit) begin
-                        // un evento remoto le toca a este L1: tiene prioridad sobre
-                        // aceptar una petición local nueva este ciclo (ver
-                        // core_bus_if.req_ready más arriba). La transición
-                        // MESI en sí (E->S, E->I/S->I) la aplica el
-                        // always_ff de tag_array de más arriba en paralelo;
-                        // acá solo se decide si hace falta ir a S_SNOOP_WB
-                        // (M) y, si es así, se latchean los registros.
-                        if (tag_array[snoop_set][snoop_hit_way].mesi == 2'b11) begin
-                            // M: hace falta flush antes de poder responder -> S_SNOOP_WB
-                            snoop_set_r <= snoop_set;
-                            snoop_way_r <= snoop_hit_way;
-                            snoop_tag_r <= snoop_tag;
-                            snoop_rw_r  <= snoop_bus_if.snoop_rw;
-                            state       <= S_SNOOP_WB;
-                        end else begin
-                            // E o S: sin flush. Guarda el estado ANTES de la
-                            // transición (E->S/E->I/S->I, aplicada en
-                            // paralelo por el always_ff de tag_array) para
-                            // reportarlo en S_SNOOP_HIT sin releer
-                            // tag_array ya mutado.
-                            snoop_resp_mesi_r  <= tag_array[snoop_set][snoop_hit_way].mesi;
-                            snoop_resp_dirty_r <= tag_array[snoop_set][snoop_hit_way].dirty;
-                            state <= S_SNOOP_HIT;
-                        end
-                    end else if (core_bus_if.req_valid && core_bus_if.req_ready) begin
+                    if (core_bus_if.req_valid && core_bus_if.req_ready) begin
                         req_rw_r     <= core_bus_if.req_data.rw;
                         hit_way_r    <= hit_way;
                         req_set_r    <= req_set;
@@ -442,50 +449,11 @@ module l1_cache import VX_gpu_pkg::*; #(
                 end
                 S_WB: begin
                     if (mem_bus_if.req_valid && mem_bus_if.req_ready)
-                        mem_req_sent_r <= 1'b1;
+                        mem_req_sent_core_r <= 1'b1;
                     if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
-                        mem_req_sent_r <= 1'b0;
-                        state          <= S_SNOOP_QUERY;  // ahora sí, consultar antes de llenar
+                        mem_req_sent_core_r <= 1'b0;
+                        state               <= S_SNOOP_QUERY;  // ahora sí, consultar antes de llenar
                     end
-                end
-                S_MISS_WAIT: begin
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
-                        mem_req_sent_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
-                        mem_req_sent_r <= 1'b0;
-                        fetched_line_r <= mem_bus_if.rsp_data.data;
-                        state          <= S_FILL;
-                    end
-                end
-                S_FILL: begin
-                    if (core_bus_if.rsp_ready)
-                        state <= S_IDLE;
-                end
-                S_SNOOP_WB: begin
-                    // mismo mecanismo que S_WB, pero volcando la línea que
-                    // pidió el snoop (snoop_way_r/snoop_set_r/snoop_tag_r),
-                    // no la víctima de un miss local. La transición
-                    // M->E en sí la aplica el always_ff de tag_array.
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
-                        mem_req_sent_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
-                        mem_req_sent_r <= 1'b0;
-                        state          <= S_SNOOP_POST_WB;
-                    end
-                end
-                S_SNOOP_POST_WB: begin
-                    // segundo paso (E->I o E->S, ver tag_array más arriba):
-                    // cierra el M->S de libro en dos pasos explícitos. La
-                    // escritura recién se ve desde afuera un ciclo después
-                    // (always_ff registrado) -> reportar ready acá sería
-                    // temprano; se reporta en S_SNOOP_DONE.
-                    state <= S_SNOOP_DONE;
-                end
-                S_SNOOP_HIT: begin
-                    state <= S_IDLE;
-                end
-                S_SNOOP_DONE: begin
-                    state <= S_IDLE;
                 end
                 S_SNOOP_QUERY: begin
                     // snoop_mst_if.snoop_valid se mantiene alto (ver assign
@@ -497,31 +465,159 @@ module l1_cache import VX_gpu_pkg::*; #(
                         state        <= is_upgrade_r ? S_HIT : S_MISS_WAIT;
                     end
                 end
+                S_MISS_WAIT: begin
+                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                        mem_req_sent_core_r <= 1'b1;
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        mem_req_sent_core_r <= 1'b0;
+                        fetched_line_r      <= mem_bus_if.rsp_data.data;
+                        state               <= S_FILL;
+                    end
+                end
+                S_FILL: begin
+                    if (core_bus_if.rsp_ready)
+                        state <= S_IDLE;
+                end
                 default: state <= S_IDLE;
             endcase
         end
     end
 
-    // ---- puerto hacia mem_bus_if (activo en S_WB, S_MISS_WAIT y S_SNOOP_WB) ----
+    // ---- FSM de snoop, independiente de la de arriba (A-8) ----
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            snp_state             <= SNP_IDLE;
+            mem_req_sent_snoop_r  <= 1'b0;
+        end else begin
+            case (snp_state)
+                SNP_IDLE: begin
+                    if (snoop_bus_if.snoop_valid && snoop_tag_hit) begin
+                        // La transición MESI en sí (E->S, E->I/S->I) la
+                        // aplica el always_ff de tag_array de más arriba
+                        // en paralelo; acá solo se decide si hace falta ir
+                        // a SNP_WB (M) y, si es así, se latchean los
+                        // registros.
+                        if (tag_array[snoop_set][snoop_hit_way].mesi == 2'b11) begin
+                            // M: hace falta flush antes de poder responder -> SNP_WB
+                            snoop_set_r <= snoop_set;
+                            snoop_way_r <= snoop_hit_way;
+                            snoop_tag_r <= snoop_tag;
+                            snoop_rw_r  <= snoop_bus_if.snoop_rw;
+                            snp_state   <= SNP_WB;
+                        end else begin
+                            // E o S: sin flush. Guarda el estado ANTES de
+                            // la transición (E->S/E->I/S->I, aplicada en
+                            // paralelo por el always_ff de tag_array) para
+                            // reportarlo en SNP_HIT sin releer tag_array
+                            // ya mutado.
+                            snoop_resp_mesi_r  <= tag_array[snoop_set][snoop_hit_way].mesi;
+                            snoop_resp_dirty_r <= tag_array[snoop_set][snoop_hit_way].dirty;
+                            snp_state <= SNP_HIT;
+                        end
+                    end
+                end
+                SNP_WB: begin
+                    // mismo mecanismo que S_WB, pero volcando la línea que
+                    // pidió el snoop (snoop_way_r/snoop_set_r/snoop_tag_r),
+                    // no la víctima de un miss local. La transición
+                    // M->E en sí la aplica el always_ff de tag_array.
+                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                        mem_req_sent_snoop_r <= 1'b1;
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        mem_req_sent_snoop_r <= 1'b0;
+                        snp_state            <= SNP_POST_WB;
+                    end
+                end
+                SNP_POST_WB: begin
+                    // segundo paso (E->I o E->S, ver tag_array más arriba):
+                    // cierra el M->S de libro en dos pasos explícitos. La
+                    // escritura recién se ve desde afuera un ciclo después
+                    // (always_ff registrado) -> reportar ready acá sería
+                    // temprano; se reporta en SNP_DONE.
+                    snp_state <= SNP_DONE;
+                end
+                SNP_HIT: begin
+                    snp_state <= SNP_IDLE;
+                end
+                SNP_DONE: begin
+                    snp_state <= SNP_IDLE;
+                end
+                default: snp_state <= SNP_IDLE;
+            endcase
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Árbitro de mem_bus_if entre las dos FSM (A-8)
+    //   Un solo puerto físico hacia la L2, pero ahora dos posibles
+    //   requesters: el camino local (`state`: S_WB/S_MISS_WAIT) y el de
+    //   responder un snoop remoto en M (`snp_state`: SNP_WB) pueden
+    //   necesitarlo al mismo tiempo. `mem_owner_r` decide a quién le toca
+    //   y mantiene la concesión hasta que esa transacción completa
+    //   (request + response), igual que hace snoop_bus.sv con sus
+    //   sesiones de broadcast.
+    //
+    //   Prioridad fija: snoop gana si los dos lo piden a la vez -- un
+    //   remoto ya está esperando nuestra respuesta (posiblemente él mismo
+    //   bloqueando a otros vía el árbitro de A-7), mientras que un miss
+    //   local, peor caso, hace esperar un poco más al pipeline propio.
+    //   `ponytail:` prioridad fija, no round-robin -- si esto genera
+    //   starvation medible del camino local bajo carga real, revisar.
+    // ------------------------------------------------------------------
+    typedef enum logic [1:0] { MEM_NONE, MEM_CORE, MEM_SNOOP } mem_owner_t;
+    mem_owner_t mem_owner_r;
+
+    wire core_wants_mem  = (state == S_WB) || (state == S_MISS_WAIT);
+    wire snoop_wants_mem = (snp_state == SNP_WB);
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            mem_owner_r <= MEM_NONE;
+        end else begin
+            case (mem_owner_r)
+                MEM_NONE: begin
+                    if (snoop_wants_mem)
+                        mem_owner_r <= MEM_SNOOP;
+                    else if (core_wants_mem)
+                        mem_owner_r <= MEM_CORE;
+                end
+                MEM_CORE: begin
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready)
+                        mem_owner_r <= MEM_NONE;
+                end
+                MEM_SNOOP: begin
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready)
+                        mem_owner_r <= MEM_NONE;
+                end
+                default: mem_owner_r <= MEM_NONE;
+            endcase
+        end
+    end
+
+    // ---- puerto hacia mem_bus_if ----
     // dirección de línea: mem_bus_if.DATA_SIZE = LINE_SIZE, así que su
     // ADDR_WIDTH ya excluye los bits de offset dentro de línea — {tag,set}
     // es exactamente esa dirección. En S_WB es la dirección VIEJA (la
     // víctima, {victim_tag_r,req_set_r}); en S_MISS_WAIT es la NUEVA
-    // ({req_tag_r,req_set_r}) — mismo set, tag distinto. En S_SNOOP_WB es la
-    // línea que pidió el snoop ({snoop_tag_r,snoop_set_r}).
-    assign mem_bus_if.req_valid       = (state == S_WB || state == S_MISS_WAIT || state == S_SNOOP_WB) && !mem_req_sent_r;
-    assign mem_bus_if.req_data.rw     = (state == S_WB || state == S_SNOOP_WB);  // write-back escribe; el refill lee
-    assign mem_bus_if.req_data.addr   = (state == S_WB)      ? {victim_tag_r, req_set_r}
-                                       : (state == S_SNOOP_WB) ? {snoop_tag_r, snoop_set_r}
+    // ({req_tag_r,req_set_r}) — mismo set, tag distinto. Si el dueño
+    // actual es el lado snoop, es la línea que pidió el snoop
+    // ({snoop_tag_r,snoop_set_r}), siempre un write (flush).
+    assign mem_bus_if.req_valid       = (mem_owner_r == MEM_CORE  && core_wants_mem  && !mem_req_sent_core_r)
+                                      || (mem_owner_r == MEM_SNOOP && snoop_wants_mem && !mem_req_sent_snoop_r);
+    assign mem_bus_if.req_data.rw     = (mem_owner_r == MEM_SNOOP) ? 1'b1 : (state == S_WB);
+    assign mem_bus_if.req_data.addr   = (mem_owner_r == MEM_SNOOP) ? {snoop_tag_r, snoop_set_r}
+                                       : (state == S_WB)            ? {victim_tag_r, req_set_r}
                                        : {req_tag_r, req_set_r};
-    assign mem_bus_if.req_data.data   = (state == S_SNOOP_WB) ? data_rd_data[snoop_way_r]
-                                                                : data_rd_data[victim_way_r];  // solo se usan en WB
+    assign mem_bus_if.req_data.data   = (mem_owner_r == MEM_SNOOP) ? snoop_rd_data[snoop_way_r]
+                                                                    : data_rd_data[victim_way_r];  // solo se usa en WB
     assign mem_bus_if.req_data.byteen = '1;
     assign mem_bus_if.req_data.attr   = '0;
     // TODO: con más de un miss en vuelo hace falta un tag real acá para
-    // no confundir respuestas — con una sola petición a la vez alcanza con 0.
+    // no confundir respuestas — con una sola petición a la vez por dueño
+    // alcanza con 0.
     assign mem_bus_if.req_data.tag    = '0;
-    assign mem_bus_if.rsp_ready       = (state == S_WB || state == S_MISS_WAIT || state == S_SNOOP_WB);
+    assign mem_bus_if.rsp_ready       = (mem_owner_r == MEM_CORE  && core_wants_mem)
+                                      || (mem_owner_r == MEM_SNOOP && snoop_wants_mem);
 
     // ---- merge de escritura (write-hit o write-allocate en un miss) ----
     // reemplaza, dentro de la línea, solo la palabra en req_off_r según
@@ -578,63 +674,67 @@ module l1_cache import VX_gpu_pkg::*; #(
 
     // ------------------------------------------------------------------
     // Señal de stall hacia el pipeline
-    //   Ya cableada como parte de la FSM de arriba: `core_bus_if.req_ready
-    //   = (state == S_IDLE)` (línea ~206) — no acepta una petición nueva
-    //   mientras hay un miss/refill en curso. No hace falta un bloque
-    //   aparte: es inherente a que la FSM solo tiene una petición en
-    //   vuelo a la vez.
+    //   Ya cableada como parte de la FSM local de arriba:
+    //   `core_bus_if.req_ready = (state == S_IDLE)` — no acepta una
+    //   petición nueva mientras hay un miss/refill en curso. No hace
+    //   falta un bloque aparte: es inherente a que la FSM local solo
+    //   tiene una petición en vuelo a la vez. Desde A-8 ya no depende de
+    //   `snp_state`: atender un snoop remoto no bloquea al pipeline.
     // ------------------------------------------------------------------
 
 
     // ------------------------------------------------------------------
     // Write-back
-    //   Reemplazo de línea dirty (M) en un miss: resuelto con el estado
-    //   S_WB de arriba (S_IDLE -> S_WB -> S_MISS_WAIT cuando la vía
-    //   víctima está valid+dirty). Vuelca data_rd_data[victim_way_r] a
-    //   {victim_tag_r,req_set_r} antes de pedir la línea nueva.
-    //
-    //   TODO (coherencia, fuera de este alcance): write-back disparado por
-    //   un snoop de invalidación sobre una línea M (snoop_bus_if) — ese es
-    //   un tercer disparador de write-back además del miss local, y
-    //   necesita su propio camino porque puede llegar mientras la FSM ya
-    //   está ocupada con otra cosa.
+    //   Reemplazo de línea dirty (M) en un miss local: resuelto con el
+    //   estado S_WB de arriba (S_IDLE -> S_WB -> S_SNOOP_QUERY cuando la
+    //   vía víctima está valid+dirty). Vuelca data_rd_data[victim_way_r] a
+    //   {victim_tag_r,req_set_r} antes de consultar/pedir la línea nueva.
+    //   El otro disparador de write-back -- un snoop de invalidación
+    //   sobre una línea M -- vive en la FSM de snoop (SNP_WB), como un
+    //   camino totalmente separado (A-8); los dos comparten mem_bus_if a
+    //   través del árbitro `mem_owner_r` de más arriba.
     // ------------------------------------------------------------------
 
 
     // ------------------------------------------------------------------
     // Lado snooper (A-6): responde a los eventos que llegan por
-    // snoop_bus_if. La transición en sí ya la aplica el always_ff de más
-    // arriba (S_IDLE/S_SNOOP_WB/S_SNOOP_POST_WB) — acá solo se arma la
-    // respuesta que el bus necesita para saber qué pasó (ready/hit/state/
-    // dirty). snoop_data se deja en cero: por diseño los datos siempre
-    // viajan por mem_bus_if, nunca cache-a-cache directo (ver
+    // snoop_bus_if. La transición en sí ya la aplica el always_ff de
+    // tag_array de más arriba (SNP_IDLE/SNP_WB/SNP_POST_WB) — acá solo se
+    // arma la respuesta que el bus necesita para saber qué pasó (ready/
+    // hit/state/dirty). snoop_data se deja en cero: por diseño los datos
+    // siempre viajan por mem_bus_if, nunca cache-a-cache directo (ver
     // docs/proposals/tfg_mesi_coherence_design.md §1.1).
     //
     // Todas las respuestas se arman en un estado de "reporte" de un ciclo
-    // (S_SNOOP_HIT para E/S sin flush, S_SNOOP_DONE para M con flush) que
-    // arranca DESPUÉS de que la escritura correspondiente ya se aplicó y
-    // ya es visible — nunca releyendo tag_array en el mismo ciclo en que
-    // se lo muta (esa carrera reportaba a veces el estado ya transicionado
-    // en vez del que tenía la línea cuando llegó el snoop). Ver
-    // snoop_resp_mesi_r/dirty_r (capturados en S_IDLE, antes de la
+    // (SNP_HIT para E/S sin flush, SNP_DONE para M con flush) que arranca
+    // DESPUÉS de que la escritura correspondiente ya se aplicó y ya es
+    // visible — nunca releyendo tag_array en el mismo ciclo en que se lo
+    // muta (esa carrera reportaba a veces el estado ya transicionado en
+    // vez del que tenía la línea cuando llegó el snoop). Ver
+    // snoop_resp_mesi_r/dirty_r (capturados en SNP_IDLE, antes de la
     // escritura) para el caso E/S.
     //
     // Si la línea NO está acá (miss en el tag array local), no hay nada
     // que transicionar: se responde en el mismo ciclo, directo desde
-    // S_IDLE (sin pasar por ningún estado de reporte) — necesario para
+    // SNP_IDLE (sin pasar por ningún estado de reporte) — necesario para
     // A-7, donde el árbitro espera `ready` de TODOS los L1 que consulta;
     // sin este caso, una consulta sobre una línea que nadie tiene se
     // queda esperando para siempre.
+    //
+    // Desde A-8, `snp_state` corre independiente de `state`: esta
+    // respuesta nunca espera a que el camino local termine lo que esté
+    // haciendo (salvo, indirectamente, cuando ambos necesitan mem_bus_if
+    // a la vez -- ver el árbitro `mem_owner_r`).
     // ------------------------------------------------------------------
-    wire snoop_miss_resolve = (state == S_IDLE) && snoop_bus_if.snoop_valid && !snoop_tag_hit;
+    wire snoop_miss_resolve = (snp_state == SNP_IDLE) && snoop_bus_if.snoop_valid && !snoop_tag_hit;
 
-    assign snoop_bus_if.snoop_ready = (state == S_SNOOP_HIT) || (state == S_SNOOP_DONE) || snoop_miss_resolve;
-    assign snoop_bus_if.snoop_hit   = (state == S_SNOOP_HIT) || (state == S_SNOOP_DONE);
-    assign snoop_bus_if.snoop_state = (state == S_SNOOP_DONE) ? 2'b11  // M (antes del flush)
-                                     : (state == S_SNOOP_HIT) ? snoop_resp_mesi_r
+    assign snoop_bus_if.snoop_ready = (snp_state == SNP_HIT) || (snp_state == SNP_DONE) || snoop_miss_resolve;
+    assign snoop_bus_if.snoop_hit   = (snp_state == SNP_HIT) || (snp_state == SNP_DONE);
+    assign snoop_bus_if.snoop_state = (snp_state == SNP_DONE) ? 2'b11  // M (antes del flush)
+                                     : (snp_state == SNP_HIT) ? snoop_resp_mesi_r
                                      : 2'b00;
-    assign snoop_bus_if.snoop_dirty = (state == S_SNOOP_DONE)
-                                     || (state == S_SNOOP_HIT && snoop_resp_dirty_r);
+    assign snoop_bus_if.snoop_dirty = (snp_state == SNP_DONE)
+                                     || (snp_state == SNP_HIT && snoop_resp_dirty_r);
     assign snoop_bus_if.snoop_data  = '0;
 
     // ------------------------------------------------------------------

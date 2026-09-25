@@ -261,16 +261,8 @@ int main(int argc, char **argv) {
   // en camino, no en el mismo ciclo) L1-1 pide otro miss de escritura
   // sobre una direccion distinta. El arbitro tiene que atender la
   // segunda consulta aunque la primera siga en curso, sin cruzar las
-  // respuestas.
-  //
-  // OJO: a proposito NO se piden los dos en el mismo ciclo. Cada L1 solo
-  // puede atender un snoop remoto en S_IDLE -- si los dos entraran a
-  // S_SNOOP_QUERY exactamente al mismo tiempo, ninguno podria responderle
-  // al otro (cada uno esperando su propio turno del arbitro) y quedarian
-  // bloqueados mutuamente (ver el comentario de S_SNOOP_QUERY en
-  // l1_cache.sv y docs/proposals/tfg_mesi_coherence_design.md §8 sobre
-  // este límite conocido). Desfasando el pedido de L1-1 se evita ese caso
-  // sin dejar de probar arbitraje real bajo contención.
+  // respuestas. (El caso de pedirlos EXACTAMENTE al mismo ciclo -- que
+  // antes de A-8 quedaba bloqueado -- se prueba aparte en el escenario 6.)
   // ------------------------------------------------------------------
   ticks = sim.reset(ticks);
   sim->core0_rsp_ready = 1;
@@ -319,6 +311,64 @@ int main(int argc, char **argv) {
   bool ok1 = do_read1(sim, ticks, st0, st1, mem, kAddrB, 8, back1, "L1-1 relee addr B");
   check(ok0 && back0 == kDataA, "L1-0 recupera su propio dato (A), sin cruzarse con B");
   check(ok1 && back1 == kDataB, "L1-1 recupera su propio dato (B), sin cruzarse con A");
+
+  // ------------------------------------------------------------------
+  // Escenario 6 (A-8): invalidacion concurrente con miss propio -- el
+  // caso que antes de separar las FSM (l1_cache.sv: `state` vs
+  // `snp_state`) quedaba bloqueado. Los dos L1 piden un miss de escritura
+  // sobre direcciones DISTINTAS exactamente en el mismo ciclo: cada uno
+  // entra a su propia consulta (S_SNOOP_QUERY) a la vez, así que cada uno
+  // tiene que poder responderle al otro mientras espera su propio turno
+  // del arbitro. Antes de A-8 esto colgaba (nunca respondia, ni con 200
+  // ciclos de margen) porque atender un snoop remoto solo corria en
+  // S_IDLE -- ninguno de los dos volvia a S_IDLE hasta terminar su propia
+  // consulta, y ninguno podia terminar su propia consulta sin que el otro
+  // respondiera. Con `snp_state` independiente, cada L1 puede responder
+  // el snoop remoto (via snp_state) al mismo tiempo que espera el suyo
+  // propio (via state) -- ver l1_cache.sv.
+  // ------------------------------------------------------------------
+  ticks = sim.reset(ticks);
+  sim->core0_rsp_ready = 1;
+  sim->core1_rsp_ready = 1;
+  st0 = MemPortState();
+  st1 = MemPortState();
+  mem.clear();
+
+  const uint32_t kAddrC = 6;  // tag=1, set=1 (distinto de A y B)
+  const uint32_t kAddrD = 8;  // tag=2, set=0
+  const uint32_t kDataC = 0xCCCC3333;
+  const uint32_t kDataD = 0xDDDD4444;
+
+  sim->core0_req_valid  = 1;
+  sim->core0_req_rw     = 1;
+  sim->core0_req_addr   = kAddrC;
+  sim->core0_req_data   = kDataC;
+  sim->core0_req_byteen = 0xF;
+  sim->core0_req_tag    = 9;
+
+  sim->core1_req_valid  = 1;
+  sim->core1_req_rw     = 1;
+  sim->core1_req_addr   = kAddrD;
+  sim->core1_req_data   = kDataD;
+  sim->core1_req_byteen = 0xF;
+  sim->core1_req_tag    = 10;
+
+  std::printf("=== L1-0 y L1-1 piden EXACTAMENTE el mismo ciclo (A-8: ex-deadlock) ===\n");
+  bool got0c = false, got1c = false;
+  for (int i = 0; i < 60 && !(got0c && got1c); ++i) {
+    step_both_mem(sim, ticks, st0, st1, mem);
+    if (sim->core0_rsp_valid) got0c = true;
+    if (sim->core1_rsp_valid) got1c = true;
+  }
+  sim->core0_req_valid = 0;
+  sim->core1_req_valid = 0;
+  check(got0c && got1c, "ambas escrituras SIMULTANEAS respondieron (ya no hay deadlock cruzado)");
+
+  uint32_t back0c = 0, back1c = 0;
+  bool ok0c = do_read0(sim, ticks, st0, st1, mem, kAddrC, 11, back0c, "L1-0 relee addr C");
+  bool ok1c = do_read1(sim, ticks, st0, st1, mem, kAddrD, 12, back1c, "L1-1 relee addr D");
+  check(ok0c && back0c == kDataC, "L1-0 recupera su propio dato (C), sin cruzarse con D");
+  check(ok1c && back1c == kDataD, "L1-1 recupera su propio dato (D), sin cruzarse con C");
 
   if (fails) {
     std::printf("snoop_bus arbitration test: FAILED (%d fallo(s))\n", fails);

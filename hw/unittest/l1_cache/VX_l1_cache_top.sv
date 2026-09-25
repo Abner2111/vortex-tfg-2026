@@ -88,7 +88,8 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
     output wire                        dbg_valid_way0,
     output wire [1:0]                  dbg_mesi_way1,
     output wire                        dbg_valid_way1,
-    output wire [3:0]                  dbg_state,
+    output wire [2:0]                  dbg_state,
+    output wire [2:0]                  dbg_snp_state,
     output wire                        dbg_snoop_tag_hit,
     output wire                        dbg_snoop_hit_way
 );
@@ -178,6 +179,7 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
     assign dbg_mesi_way1  = dut.tag_array[0][1].mesi;
     assign dbg_valid_way1 = dut.tag_array[0][1].valid;
     assign dbg_state          = dut.state;
+    assign dbg_snp_state      = dut.snp_state;
     assign dbg_snoop_tag_hit  = dut.snoop_tag_hit;
     assign dbg_snoop_hit_way  = dut.snoop_hit_way;
 
