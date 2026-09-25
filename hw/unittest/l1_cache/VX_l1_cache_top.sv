@@ -66,6 +66,20 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
     output wire                        snoop_dirty,
     output wire [LINE_SIZE*8-1:0]      snoop_data,
 
+    // Snoop master (A-7): la consulta PROPIA del DUT en cada miss/upgrade
+    // local. En este testbench aislado no hay otro L1 real -- main.cpp
+    // responde siempre "nadie la tiene" (hit=0, ready=1), igual que un
+    // bus de 1 solo L1 conectado haría en la práctica; si no, cada miss
+    // local se quedaría esperando para siempre.
+    output wire                        snoop_mst_valid,
+    output wire [MEM_ADDR_WIDTH-1:0]   snoop_mst_addr,
+    output wire                        snoop_mst_rw,
+    input  wire                        snoop_mst_ready,
+    input  wire                        snoop_mst_hit,
+    input  wire [1:0]                  snoop_mst_state,
+    input  wire                        snoop_mst_dirty,
+    input  wire [LINE_SIZE*8-1:0]      snoop_mst_data,
+
     // Debug (solo test, no sintetizable): estado MESI/valid crudo del set 0
     // -- todos los escenarios de snoop de main.cpp usan ese set -- para
     // verificar las transiciones directamente en vez de inferirlas por
@@ -92,6 +106,11 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
         .ADDR_WIDTH (MEM_ADDR_WIDTH),
         .LINE_SIZE  (LINE_SIZE)
     ) snoop_bus_if();
+
+    VX_snoop_bus_if #(
+        .ADDR_WIDTH (MEM_ADDR_WIDTH),
+        .LINE_SIZE  (LINE_SIZE)
+    ) snoop_mst_if();
 
     assign core_bus_if.req_valid       = core_req_valid;
     assign core_bus_if.req_data.rw     = core_req_rw;
@@ -129,6 +148,15 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
     assign snoop_dirty                 = snoop_bus_if.snoop_dirty;
     assign snoop_data                  = snoop_bus_if.snoop_data;
 
+    assign snoop_mst_valid             = snoop_mst_if.snoop_valid;
+    assign snoop_mst_addr              = snoop_mst_if.snoop_addr;
+    assign snoop_mst_rw                = snoop_mst_if.snoop_rw;
+    assign snoop_mst_if.snoop_ready    = snoop_mst_ready;
+    assign snoop_mst_if.snoop_hit      = snoop_mst_hit;
+    assign snoop_mst_if.snoop_state    = snoop_mst_state;
+    assign snoop_mst_if.snoop_dirty    = snoop_mst_dirty;
+    assign snoop_mst_if.snoop_data     = snoop_mst_data;
+
     l1_cache #(
         .CACHE_SIZE     (CACHE_SIZE),
         .LINE_SIZE      (LINE_SIZE),
@@ -141,7 +169,8 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
         .reset        (reset),
         .core_bus_if  (core_bus_if),
         .mem_bus_if   (mem_bus_if),
-        .snoop_bus_if (snoop_bus_if)
+        .snoop_bus_if (snoop_bus_if),
+        .snoop_mst_if (snoop_mst_if)
     );
 
     assign dbg_mesi_way0  = dut.tag_array[0][0].mesi;

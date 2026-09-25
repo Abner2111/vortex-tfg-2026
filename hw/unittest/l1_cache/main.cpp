@@ -207,6 +207,15 @@ int main(int argc, char **argv) {
   sim->mem_req_ready  = 1;  // el modelo de "L2" siempre puede aceptar
   sim->mem_rsp_valid  = 0;
 
+  // Mock del lado master del snoop bus (A-7): en este testbench aislado no
+  // hay otro L1 real conectado, así que se responde siempre "nadie más la
+  // tiene" -- constante, no necesita re-armarse en cada reset del DUT (es
+  // un valor del driver C++, no del RTL).
+  sim->snoop_mst_ready = 1;
+  sim->snoop_mst_hit   = 0;
+  sim->snoop_mst_state = 0;
+  sim->snoop_mst_dirty = 0;
+
   std::unordered_map<uint32_t, uint64_t> mem;
 
   // Direcciones (word) elegidas para caer las tres en el mismo set con
