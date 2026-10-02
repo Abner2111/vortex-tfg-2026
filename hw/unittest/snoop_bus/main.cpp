@@ -26,6 +26,7 @@
 #include "VVX_snoop_bus_top.h"
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <unordered_map>
 
 using Sim = vl_simulator<VVX_snoop_bus_top>;
@@ -88,6 +89,26 @@ static void step_both_mem(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortS
   ticks = sim.step(ticks, 2);
 }
 
+// Un write es fire-and-forget a nivel de bus (ver l1_cache.sv y
+// hw/unittest/l1_cache/main.cpp: solo las lecturas devuelven respuesta,
+// mismo contrato que la caché real de Vortex) -- completa cuando
+// req_ready vuelve a 1 (la FSM volvió a S_IDLE), no cuando llega
+// rsp_valid (que para un write nunca llega).
+template <typename ReqReadyFn>
+static bool wait_write_done(ReqReadyFn get_req_ready, int max_cycles,
+                             std::function<void()> step_fn) {
+  bool accepted = false;
+  for (int i = 0; i < max_cycles; ++i) {
+    step_fn();
+    if (!accepted) {
+      if (!get_req_ready()) accepted = true;
+    } else if (get_req_ready()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- L1 #0: escritura/lectura en primer plano ----
 static bool do_write0(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState &st1, MemMap &mem,
                        uint32_t addr, uint32_t data, uint32_t tag, const char *label, int max_cycles = 40) {
@@ -98,11 +119,8 @@ static bool do_write0(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState
   sim->core0_req_byteen = 0xF;
   sim->core0_req_tag    = tag;
   std::printf("=== %s ===\n", label);
-  bool got = false;
-  for (int i = 0; i < max_cycles && !got; ++i) {
-    step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core0_rsp_valid) got = true;
-  }
+  bool got = wait_write_done([&]{ return (bool)sim->core0_req_ready; }, max_cycles,
+                             [&]{ step_both_mem(sim, ticks, st0, st1, mem); });
   sim->core0_req_valid = 0;
   return got;
 }
@@ -134,11 +152,8 @@ static bool do_write1(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState
   sim->core1_req_byteen = 0xF;
   sim->core1_req_tag    = tag;
   std::printf("=== %s ===\n", label);
-  bool got = false;
-  for (int i = 0; i < max_cycles && !got; ++i) {
-    step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core1_rsp_valid) got = true;
-  }
+  bool got = wait_write_done([&]{ return (bool)sim->core1_req_ready; }, max_cycles,
+                             [&]{ step_both_mem(sim, ticks, st0, st1, mem); });
   sim->core1_req_valid = 0;
   return got;
 }
@@ -284,7 +299,9 @@ int main(int argc, char **argv) {
   sim->core0_req_tag    = 5;
 
   std::printf("=== L1-0 y L1-1 piden en paralelo, desfasados (arbitraje bajo contencion) ===\n");
-  bool got0 = false, got1 = false;
+  // Dos writes: fire-and-forget a nivel de bus (ver l1_cache.sv), cada uno
+  // completa cuando su propio req_ready vuelve a 1, no con rsp_valid.
+  bool got0 = false, got1 = false, acc0 = false, acc1 = false;
   bool l1_started = false;
   for (int i = 0; i < 200 && !(got0 && got1); ++i) {
     if (i == 3 && !l1_started) {
@@ -299,8 +316,14 @@ int main(int argc, char **argv) {
       l1_started = true;
     }
     step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core0_rsp_valid) got0 = true;
-    if (sim->core1_rsp_valid) got1 = true;
+    if (!got0) {
+      if (!acc0) { if (!sim->core0_req_ready) acc0 = true; }
+      else if (sim->core0_req_ready) got0 = true;
+    }
+    if (!got1 && l1_started) {
+      if (!acc1) { if (!sim->core1_req_ready) acc1 = true; }
+      else if (sim->core1_req_ready) got1 = true;
+    }
   }
   sim->core0_req_valid = 0;
   sim->core1_req_valid = 0;
@@ -354,11 +377,17 @@ int main(int argc, char **argv) {
   sim->core1_req_tag    = 10;
 
   std::printf("=== L1-0 y L1-1 piden EXACTAMENTE el mismo ciclo (A-8: ex-deadlock) ===\n");
-  bool got0c = false, got1c = false;
+  bool got0c = false, got1c = false, acc0c = false, acc1c = false;
   for (int i = 0; i < 60 && !(got0c && got1c); ++i) {
     step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core0_rsp_valid) got0c = true;
-    if (sim->core1_rsp_valid) got1c = true;
+    if (!got0c) {
+      if (!acc0c) { if (!sim->core0_req_ready) acc0c = true; }
+      else if (sim->core0_req_ready) got0c = true;
+    }
+    if (!got1c) {
+      if (!acc1c) { if (!sim->core1_req_ready) acc1c = true; }
+      else if (sim->core1_req_ready) got1c = true;
+    }
   }
   sim->core0_req_valid = 0;
   sim->core1_req_valid = 0;

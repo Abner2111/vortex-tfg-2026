@@ -27,17 +27,22 @@
 // Codificaciones verificadas con el ensamblador real del toolchain
 // (riscv32-unknown-elf-as + objdump), no solo a mano.
 //
-// STATUS (A-9, pausado -- ver docs/proposals/tfg_core_integration_progress.md):
-// confirmado con los debug taps de VX_core_top.sv (dbg_active_warps,
-// dbg_lsu_*): el fetch, el LOAD y el despacho del STORE desde el LSU
-// funcionan -- el STORE incluso dispara correctamente el write-allocate
-// read de l1_cache.sv. Pero la corrida completa termina golpeando una
-// aserción real DENTRO de VX_mem_coalescer/VX_allocator (código de
-// Vortex, no del TFG) -- "releasing invalid addr 0". No se investigó la
-// causa raíz todavía (¿bug latente de Vortex bajo esta config reducida,
-// o timing de respuesta de este mock distinto al de la caché real?).
-// Este test por ahora NO PASA de punta a punta -- se deja documentado y
-// buildable para retomar.
+// STATUS (A-9): fetch -> decode -> execute -> LSU -> l1_cache.sv funciona
+// de punta a punta (hit y miss, lectura y escritura con write-allocate).
+// La corrida completa llegaba a golpear una aserción real DENTRO de
+// VX_mem_coalescer/VX_allocator (código de Vortex, no del TFG)
+// -- "releasing invalid addr" -- causa raíz confirmada: l1_cache.sv
+// mandaba una respuesta por core_bus_if para los WRITES, pero
+// VX_mem_coalescer (igual que la caché real, VX_cache_bank.sv) asume que
+// un write es fire-and-forget a nivel de bus y solo encola un slot a
+// liberar para los reads -- una respuesta espuria a un write hacia que
+// el coalescer liberara un slot que nunca adquirió para esa transacción.
+// Corregido gating `core_bus_if.rsp_valid` en l1_cache.sv con `!req_rw_r`
+// (ver el comentario en ese archivo). El chequeo final de este test mira
+// el estado interno de tfg_l1 (dbg_dst_*), no el mock de memoria: la L1
+// es write-back, asi que el store queda dirty adentro de la cache y
+// nunca se vuelca a "memoria" sin una eviction que este programa no
+// dispara.
 //
 // build: make CONFIGS="-DVX_CFG_NUM_THREADS=2 -DVX_CFG_NUM_WARPS=2"
 // (DCACHE_NUM_REQS tiene que dar 1 para esta config -- ver el chequeo de
@@ -158,24 +163,49 @@ int main(int argc, char **argv) {
   Line mem_cap_wdata{};
   bool mem_cap_rw = false;
 
-  tick = sim.reset(tick);
+  // vl_simulator::reset() solo sostiene reset 1 ciclo -- el driver real
+  // (sim/rtlsim/processor.cpp) lo sostiene VX_CFG_RESET_DELAY (8) ciclos,
+  // y bombea otros VX_CFG_RESET_DELAY ciclos MAS despues de que reset
+  // baja, antes de tocar nada ("permitir que el estado interno del
+  // pipeline se asiente"). Sin esto, encontramos una aserción real
+  // dentro de VX_mem_coalescer/VX_allocator (releasing invalid addr) que
+  // NO aparece corriendo el mismo NUM_THREADS=2 a traves del pipeline
+  // real (confirmado con tests/regression/basic via blackbox.sh
+  // --driver=rtlsim) -- era un artefacto de este arnés, no un bug de
+  // Vortex.
+  sim->reset = 1;
+  for (int i = 0; i < VX_CFG_RESET_DELAY; ++i) tick = sim.step(tick, 2);
+  sim->reset = 0;
+  for (int i = 0; i < VX_CFG_RESET_DELAY; ++i) tick = sim.step(tick, 2);
   sim->start           = 0;
   sim->dcr_req_valid   = 0;
   sim->dcr_req_rw      = 0;
   sim->gbar_req_ready  = 1;
   sim->gbar_rsp_valid  = 0;
 
-  // Kernel mínimo: 1 CTA, 1 warp, 1 thread -- ver comentario de arriba.
+  // Kernel mínimo: 1 CTA, 1 warp, 1 thread. Secuencia completa, no la
+  // versión resumida de hw/unittest/kmu/main.cpp -- mirror de la real
+  // (sw/runtime/common/queue.cpp:424-450): faltaban KERNEL_ENTRY0,
+  // LMEM_SIZE, WARP_STEP_Y/Z y CLUSTER_DIM_X/Y/Z (quedaban en su valor
+  // de reset, 0, que el KMU real nunca ve sin pasar por esta secuencia
+  // completa).
   write_dcr(sim, tick, VX_DCR_KMU_STARTUP_ADDR0, kProgramBase);
+  write_dcr(sim, tick, VX_DCR_KMU_KERNEL_ENTRY0, kProgramBase);
   write_dcr(sim, tick, VX_DCR_KMU_STARTUP_ARG0,  0);
-  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_X,    1);
-  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_Y,    1);
-  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_Z,    1);
   write_dcr(sim, tick, VX_DCR_KMU_BLOCK_DIM_X,   1);
   write_dcr(sim, tick, VX_DCR_KMU_BLOCK_DIM_Y,   1);
   write_dcr(sim, tick, VX_DCR_KMU_BLOCK_DIM_Z,   1);
+  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_X,    1);
+  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_Y,    1);
+  write_dcr(sim, tick, VX_DCR_KMU_GRID_DIM_Z,    1);
+  write_dcr(sim, tick, VX_DCR_KMU_LMEM_SIZE,     0);
   write_dcr(sim, tick, VX_DCR_KMU_BLOCK_SIZE,    1);
   write_dcr(sim, tick, VX_DCR_KMU_WARP_STEP_X,   VX_CFG_NUM_THREADS);
+  write_dcr(sim, tick, VX_DCR_KMU_WARP_STEP_Y,   1);
+  write_dcr(sim, tick, VX_DCR_KMU_WARP_STEP_Z,   1);
+  write_dcr(sim, tick, VX_DCR_KMU_CLUSTER_DIM_X, 1);
+  write_dcr(sim, tick, VX_DCR_KMU_CLUSTER_DIM_Y, 1);
+  write_dcr(sim, tick, VX_DCR_KMU_CLUSTER_DIM_Z, 1);
 
   sim->start = 1;
   tick = sim.step(tick, 2);
@@ -196,6 +226,14 @@ int main(int argc, char **argv) {
     service_icache(sim);
     service_dcache_mem(sim, mem, mem_phase, mem_cap_addr, mem_cap_wdata, mem_cap_rw);
     tick = sim.step(tick, 2);
+    if (sim->dbg_coal_ibuf_push || sim->dbg_coal_ibuf_pop || sim->dbg_coal_out_rsp_valid)
+      std::printf("  [dbg i=%d] coal: push=%d pop=%d waddr=%d raddr=%d in_rw=%d in_valid=%d "
+                  "rsp_valid=%d rsp_ready=%d rsp_eop=%d\n", i,
+                  (int)sim->dbg_coal_ibuf_push, (int)sim->dbg_coal_ibuf_pop,
+                  (int)sim->dbg_coal_ibuf_waddr, (int)sim->dbg_coal_ibuf_raddr,
+                  (int)sim->dbg_coal_in_req_rw, (int)sim->dbg_coal_in_req_valid,
+                  (int)sim->dbg_coal_out_rsp_valid, (int)sim->dbg_coal_out_rsp_ready,
+                  (int)sim->dbg_coal_out_rsp_eop);
     if (!sim->busy) finished = true;
     if (finished && drain_until < 0) drain_until = i + kDrainCycles;
     if (finished && i >= drain_until) break;
@@ -206,19 +244,39 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  auto it = mem.find(kDstAddr / kLineSize);
-  if (it == mem.end()) {
-    std::printf("FAIL: nunca se escribio la linea destino (mem[0x%x])\n", kDstAddr);
+  // tfg_l1 es write-back: el store hace write-allocate y marca la linea
+  // dirty/M adentro de la cache, pero nunca la vuelca a "memoria" sin una
+  // eviction -- este programa de prueba no dispara ninguna. Por eso el
+  // chequeo final mira el estado interno de tfg_l1 (dbg_dst_*, set=0 /
+  // tag=2 para kDstAddr=0x2000, ver VX_core_top.sv) en vez del mock de
+  // memoria.
+  int hit_way = -1;
+  for (int w = 0; w < 4; ++w) {
+    if ((sim->dbg_dst_way_match >> w) & 1) { hit_way = w; break; }
+  }
+  if (hit_way < 0) {
+    std::printf("FAIL: tfg_l1 nunca cacheo la linea destino (set=0 tag=2 para mem[0x%x])\n", kDstAddr);
     return 1;
   }
-  uint32_t got = it->second[0];  // kDstAddr tambien cae en offset 0 de su linea
+  if (!((sim->dbg_dst_way_dirty >> hit_way) & 1)) {
+    std::printf("FAIL: tfg_l1 way%d tiene la linea destino pero no esta dirty (store no se aplico)\n", hit_way);
+    return 1;
+  }
+  uint64_t word0;
+  switch (hit_way) {
+    case 0: word0 = sim->dbg_dst_way0_word0; break;
+    case 1: word0 = sim->dbg_dst_way1_word0; break;
+    case 2: word0 = sim->dbg_dst_way2_word0; break;
+    default: word0 = sim->dbg_dst_way3_word0; break;
+  }
+  uint32_t got = (uint32_t)word0;  // kDstAddr cae en offset 0 (mitad baja) de su linea
   uint32_t expected = kSrcValue + 1;
   if (got != expected) {
-    std::printf("FAIL: mem[0x%x] = 0x%x, esperado 0x%x\n", kDstAddr, got, expected);
+    std::printf("FAIL: tfg_l1 way%d linea destino = 0x%x, esperado 0x%x\n", hit_way, got, expected);
     return 1;
   }
 
-  std::printf("core+l1 end-to-end test: PASSED (mem[0x%x] = 0x%x, %lu ticks)\n",
-              kDstAddr, got, (unsigned long)tick);
+  std::printf("core+l1 end-to-end test: PASSED (tfg_l1 way%d dirty, mem[0x%x] = 0x%x, %lu ticks)\n",
+              hit_way, kDstAddr, got, (unsigned long)tick);
   return 0;
 }

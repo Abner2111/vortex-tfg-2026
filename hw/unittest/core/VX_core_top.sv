@@ -99,15 +99,41 @@ module VX_core_top import VX_gpu_pkg::*;
     // Status
     output wire                             busy,
 
-    // TEMP DEBUG (A-9): estado interno del scheduler, para diagnosticar
-    // por que el store nunca llega a dcache_bus_if.
+    // Debug: estado interno del scheduler y del LSU.
     output wire [`VX_CFG_NUM_WARPS-1:0]     dbg_active_warps,
     output wire [`VX_CFG_NUM_WARPS-1:0]     dbg_stalled_warps,
     output wire [PC_BITS-1:0]               dbg_warp_pc0,
     output wire                             dbg_lsu_execute_valid,
     output wire                             dbg_lsu_mem_req_valid,
     output wire                             dbg_lsu_is_store,
-    output wire                             dbg_lsu_no_rsp_buf_ready
+    output wire                             dbg_lsu_no_rsp_buf_ready,
+
+    // Debug: req_ibuf del mem_coalescer.
+    output wire                             dbg_coal_ibuf_push,
+    output wire                             dbg_coal_ibuf_pop,
+    output wire [2:0]                       dbg_coal_ibuf_waddr,
+    output wire [2:0]                       dbg_coal_ibuf_raddr,
+    output wire                             dbg_coal_in_req_rw,
+    output wire                             dbg_coal_in_req_valid,
+    output wire                             dbg_coal_out_rsp_valid,
+    output wire                             dbg_coal_out_rsp_ready,
+    output wire                             dbg_coal_out_rsp_eop,
+
+    // Debug: estado interno de tfg_l1 para la linea de kDstAddr=0x2000
+    // (set=0, tag=2 -- calculado a mano para esta config: WORD_SIZE=8,
+    // LINE_SIZE=16, NUM_WAYS=4, CACHE_SIZE=16384 -> NUM_SETS=256,
+    // OFFSET_BITS=1, SET_BITS=8; word_addr=0x2000>>3=0x400;
+    // set=(word_addr>>1)&0xFF=0; tag=word_addr>>9=2). La L1 es
+    // write-back: un store solo marca la linea dirty/M adentro de
+    // tfg_l1, no se propaga a "memoria" sin una eviction -- el chequeo
+    // de fin-a-fin mira este estado interno, no el mock de memoria.
+    output wire [3:0]                       dbg_dst_way_valid,
+    output wire [3:0]                       dbg_dst_way_dirty,
+    output wire [3:0]                       dbg_dst_way_match,
+    output wire [63:0]                      dbg_dst_way0_word0,
+    output wire [63:0]                      dbg_dst_way1_word0,
+    output wire [63:0]                      dbg_dst_way2_word0,
+    output wire [63:0]                      dbg_dst_way3_word0
 );
 
     VX_gbar_bus_if gbar_bus_if();
@@ -360,5 +386,26 @@ module VX_core_top import VX_gpu_pkg::*;
     assign dbg_lsu_mem_req_valid   = core.execute.lsu_unit.g_blocks[0].lsu_slice.mem_req_valid;
     assign dbg_lsu_is_store        = core.execute.lsu_unit.g_blocks[0].lsu_slice.execute_if.data.op_args.lsu.is_store;
     assign dbg_lsu_no_rsp_buf_ready = core.execute.lsu_unit.g_blocks[0].lsu_slice.no_rsp_buf_ready;
+
+    assign dbg_coal_ibuf_push     = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.ibuf_push;
+    assign dbg_coal_ibuf_pop      = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.ibuf_pop;
+    assign dbg_coal_ibuf_waddr    = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.ibuf_waddr;
+    assign dbg_coal_ibuf_raddr    = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.ibuf_raddr;
+    assign dbg_coal_in_req_rw     = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.in_req_rw;
+    assign dbg_coal_in_req_valid  = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.in_req_valid;
+    assign dbg_coal_out_rsp_valid = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.out_rsp_valid;
+    assign dbg_coal_out_rsp_ready = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.out_rsp_ready;
+    assign dbg_coal_out_rsp_eop   = core.mem_unit.g_coalescing.g_coalescers[0].mem_coalescer.out_rsp_eop;
+
+    for (genvar w = 0; w < 4; ++w) begin : g_dbg_dst_way
+        assign dbg_dst_way_valid[w] = tfg_l1.tag_array[0][w].valid;
+        assign dbg_dst_way_dirty[w] = tfg_l1.tag_array[0][w].dirty;
+        assign dbg_dst_way_match[w] = tfg_l1.tag_array[0][w].valid
+                                    && (tfg_l1.tag_array[0][w].tag == 2);
+    end
+    assign dbg_dst_way0_word0 = tfg_l1.g_data_way[0].mem[0][63:0];
+    assign dbg_dst_way1_word0 = tfg_l1.g_data_way[1].mem[0][63:0];
+    assign dbg_dst_way2_word0 = tfg_l1.g_data_way[2].mem[0][63:0];
+    assign dbg_dst_way3_word0 = tfg_l1.g_data_way[3].mem[0][63:0];
 
 endmodule

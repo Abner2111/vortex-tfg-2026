@@ -667,7 +667,7 @@ module l1_cache import VX_gpu_pkg::*; #(
     wire [WORD_SIZE*8-1:0] hit_rsp_word  = hit_line_old[req_off_r*WORD_SIZE*8 +: WORD_SIZE*8];
     wire [WORD_SIZE*8-1:0] fill_rsp_word = fetched_line_r[req_off_r*WORD_SIZE*8 +: WORD_SIZE*8];
 
-    assign core_bus_if.rsp_valid    = (state == S_HIT) || (state == S_FILL);
+    assign core_bus_if.rsp_valid    = ((state == S_HIT) || (state == S_FILL)) && !req_rw_r;
     assign core_bus_if.rsp_data.tag = req_ctag_r;
     assign core_bus_if.rsp_data.data = (state == S_HIT) ? hit_rsp_word : fill_rsp_word;
 

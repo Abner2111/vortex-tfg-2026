@@ -39,14 +39,21 @@ using Sim = vl_simulator<VVX_l1_cache_top>;
 // Corre hasta max_cycles ciclos: acepta cualquier petición hacia
 // mem_bus_if contra `mem` (persistente entre llamadas, así que un
 // write-back en una llamada lo ve la siguiente como un read-hit de
-// "memoria"), y termina en cuanto el core recibe una respuesta.
+// "memoria"), y termina cuando la transacción completa -- un READ
+// completa cuando llega core_rsp_valid (la L1 sí responde lecturas);
+// un WRITE es fire-and-forget a nivel de bus (ver l1_cache.sv: solo las
+// lecturas devuelven respuesta -- mismo contrato que la caché real de
+// Vortex, VX_cache_bank.sv, encontrado al integrar esta L1 en un VX_core
+// real en A-9), así que completa cuando core_req_ready vuelve a 1 (la
+// FSM volvió a S_IDLE).
 static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint64_t> &mem,
-                     uint32_t &out_data, uint32_t &out_tag, const char *label,
+                     bool is_write, uint32_t &out_data, uint32_t &out_tag, const char *label,
                      int max_cycles = 30) {
   enum { WAIT_REQ, DELAY, RESPONDING } mem_state = WAIT_REQ;
   uint32_t cap_addr = 0, cap_wdata = 0;
   bool cap_rw = false;
   bool got_rsp = false;
+  bool req_accepted = false;  // para el camino de escritura: ya vimos req_ready caer a 0
 
   // core_req_valid se deja en alto (puesto por do_write/do_read) durante
   // toda la transacción y solo lo baja el caller al final.
@@ -89,7 +96,13 @@ static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
 
     ticks = sim.step(ticks, 2);
 
-    if (sim->core_rsp_valid) {
+    if (is_write) {
+      if (!req_accepted) {
+        if (!sim->core_req_ready) req_accepted = true;  // la FSM salió de S_IDLE
+      } else if (sim->core_req_ready) {
+        got_rsp = true;  // volvió a S_IDLE: la escritura completó
+      }
+    } else if (sim->core_rsp_valid) {
       got_rsp  = true;
       out_data = sim->core_rsp_data;
       out_tag  = sim->core_rsp_tag;
@@ -109,8 +122,9 @@ static bool do_write(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uin
   sim->core_req_byteen = 0xF;
   sim->core_req_tag    = tag;
   uint32_t rsp_data;
-  bool ok = run_txn(sim, ticks, mem, rsp_data, rsp_tag, label);
+  bool ok = run_txn(sim, ticks, mem, /*is_write=*/true, rsp_data, rsp_tag, label);
   sim->core_req_valid = 0;
+  rsp_tag = tag;  // sin respuesta real: el caller solo usa esto para loguear
   return ok;
 }
 
@@ -122,7 +136,7 @@ static bool do_read(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
   sim->core_req_addr   = addr;
   sim->core_req_byteen = 0xF;
   sim->core_req_tag    = tag;
-  bool ok = run_txn(sim, ticks, mem, rsp_data, rsp_tag, label);
+  bool ok = run_txn(sim, ticks, mem, /*is_write=*/false, rsp_data, rsp_tag, label);
   sim->core_req_valid = 0;
   return ok;
 }
