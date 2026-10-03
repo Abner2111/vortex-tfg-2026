@@ -27,6 +27,15 @@
 // M->E->S/M->E->I documentadas en
 // docs/proposals/tfg_mesi_coherence_design.md. El lado master (I->E vs.
 // I->S en un miss local) queda para A-7, no se prueba acá.
+//
+// Parte 3 (A-10, pruebas de stall): las partes 1 y 2 ya cubren hit, miss
+// y write-back -- lo que agrega A-10 es backpressure de los dos lados del
+// bus (mem_req_ready=0 durante un fill o un write-back; core_rsp_ready=0
+// sobre un read-hit) para confirmar que la FSM espera sin perder ni
+// corromper la transacción en vuelo. Mismos helpers run_txn/do_read/
+// do_write de la parte 1, con los nuevos parámetros opcionales
+// mem_stall_cycles/rsp_stall_cycles (default 0 = comportamiento de
+// siempre).
 
 #include "vl_simulator.h"
 #include "VVX_l1_cache_top.h"
@@ -46,9 +55,18 @@ using Sim = vl_simulator<VVX_l1_cache_top>;
 // Vortex, VX_cache_bank.sv, encontrado al integrar esta L1 en un VX_core
 // real en A-9), así que completa cuando core_req_ready vuelve a 1 (la
 // FSM volvió a S_IDLE).
+// mem_stall_cycles/rsp_stall_cycles (A-10, pruebas de stall): por defecto 0,
+// mismo comportamiento de siempre (acepta/responde apenas puede). Con
+// mem_stall_cycles>0, mem_req_ready se mantiene en 0 esas vueltas mientras
+// haya un mem_req_valid pendiente -- simula un L2/memoria lento, para
+// confirmar que la FSM espera sin perder ni corromper la petición.
+// rsp_stall_cycles>0 mantiene core_rsp_ready en 0 las primeras vueltas --
+// simula un consumidor lento del lado del core, para confirmar que la
+// cache sostiene rsp_valid/rsp_data estables (no los pisa ni avanza de
+// estado) hasta que el consumidor por fin acepta.
 static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint64_t> &mem,
                      bool is_write, uint32_t &out_data, uint32_t &out_tag, const char *label,
-                     int max_cycles = 30) {
+                     int max_cycles = 30, int mem_stall_cycles = 0, int rsp_stall_cycles = 0) {
   enum { WAIT_REQ, DELAY, RESPONDING } mem_state = WAIT_REQ;
   uint32_t cap_addr = 0, cap_wdata = 0;
   bool cap_rw = false;
@@ -70,12 +88,17 @@ static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
   for (int i = 0; i < max_cycles && !got_rsp; ++i) {
     switch (mem_state) {
       case WAIT_REQ:
-        sim->mem_req_ready = 1;
-        if (sim->mem_req_valid) {
-          cap_addr  = sim->mem_req_addr;
-          cap_rw    = sim->mem_req_rw;
-          cap_wdata = sim->mem_req_data;
-          mem_state = DELAY;
+        if (sim->mem_req_valid && mem_stall_cycles > 0) {
+          sim->mem_req_ready = 0;
+          --mem_stall_cycles;
+        } else {
+          sim->mem_req_ready = 1;
+          if (sim->mem_req_valid) {
+            cap_addr  = sim->mem_req_addr;
+            cap_rw    = sim->mem_req_rw;
+            cap_wdata = sim->mem_req_data;
+            mem_state = DELAY;
+          }
         }
         break;
       case DELAY: {
@@ -94,6 +117,10 @@ static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
         break;
     }
 
+    // core_rsp_ready en 0 las primeras rsp_stall_cycles vueltas -- ver
+    // comentario de rsp_stall_cycles más arriba.
+    sim->core_rsp_ready = (i < rsp_stall_cycles) ? 0 : 1;
+
     ticks = sim.step(ticks, 2);
 
     if (is_write) {
@@ -102,7 +129,7 @@ static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
       } else if (sim->core_req_ready) {
         got_rsp = true;  // volvió a S_IDLE: la escritura completó
       }
-    } else if (sim->core_rsp_valid) {
+    } else if (sim->core_rsp_valid && sim->core_rsp_ready) {
       got_rsp  = true;
       out_data = sim->core_rsp_data;
       out_tag  = sim->core_rsp_tag;
@@ -114,7 +141,7 @@ static bool run_txn(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint
 
 static bool do_write(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint64_t> &mem,
                       uint32_t addr, uint32_t data, uint32_t tag, uint32_t &rsp_tag,
-                      const char *label) {
+                      const char *label, int mem_stall_cycles = 0) {
   sim->core_req_valid  = 1;
   sim->core_req_rw     = 1;
   sim->core_req_addr   = addr;
@@ -122,7 +149,8 @@ static bool do_write(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uin
   sim->core_req_byteen = 0xF;
   sim->core_req_tag    = tag;
   uint32_t rsp_data;
-  bool ok = run_txn(sim, ticks, mem, /*is_write=*/true, rsp_data, rsp_tag, label);
+  bool ok = run_txn(sim, ticks, mem, /*is_write=*/true, rsp_data, rsp_tag, label,
+                     /*max_cycles=*/30, mem_stall_cycles);
   sim->core_req_valid = 0;
   rsp_tag = tag;  // sin respuesta real: el caller solo usa esto para loguear
   return ok;
@@ -130,13 +158,14 @@ static bool do_write(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uin
 
 static bool do_read(Sim &sim, uint64_t &ticks, std::unordered_map<uint32_t, uint64_t> &mem,
                      uint32_t addr, uint32_t tag, uint32_t &rsp_data, uint32_t &rsp_tag,
-                     const char *label) {
+                     const char *label, int mem_stall_cycles = 0, int rsp_stall_cycles = 0) {
   sim->core_req_valid  = 1;
   sim->core_req_rw     = 0;
   sim->core_req_addr   = addr;
   sim->core_req_byteen = 0xF;
   sim->core_req_tag    = tag;
-  bool ok = run_txn(sim, ticks, mem, /*is_write=*/false, rsp_data, rsp_tag, label);
+  bool ok = run_txn(sim, ticks, mem, /*is_write=*/false, rsp_data, rsp_tag, label,
+                     /*max_cycles=*/30, mem_stall_cycles, rsp_stall_cycles);
   sim->core_req_valid = 0;
   return ok;
 }
@@ -432,6 +461,76 @@ int main(int argc, char **argv) {
     } else {
       std::printf("M->E->I: ok, flush volcó el dato y la línea quedó invalidada\n");
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Parte 3 (A-10): pruebas de stall. Las partes 1 y 2 ya cubren hit, miss
+  // y write-back con memoria/consumidor siempre listos (mem_req_ready=1,
+  // core_rsp_ready=1) -- lo que falta es confirmar que la FSM espera
+  // correctamente cuando CUALQUIERA de los dos lados hace backpressure,
+  // sin perder la petición en vuelo ni corromper tag/data array.
+  // ------------------------------------------------------------------
+  ticks = sim.reset(ticks);
+  sim->core_rsp_ready = 1;
+  sim->mem_req_ready  = 1;
+  sim->mem_rsp_valid  = 0;
+  mem.clear();
+
+  // --- Estancamiento en mem_bus_if durante un miss (fill): el "L2" tarda
+  //     varios ciclos en aceptar el pedido de la línea. La FSM tiene que
+  //     quedarse esperando sin reintentar ni perder la petición -- si el
+  //     dato final es correcto, no se corrompió nada mientras esperaba.
+  if (!do_read(sim, ticks, mem, kAddr0, 30, rsp_data, rsp_tag,
+               "[stall] read addr0 (miss, mem tarda 5 ciclos en aceptar)",
+               /*mem_stall_cycles=*/5)) {
+    std::printf("FAIL: read addr0 (stall de mem en miss) nunca respondió\n"); ++fails;
+  } else if (rsp_data != 0) {
+    // kAddr0 nunca se escribió en esta corrida -- la "memoria" de fondo
+    // debe traer 0 (default de unordered_map), no basura.
+    std::printf("FAIL: read addr0 (stall de mem en miss) trajo 0x%08X, esperado 0x0\n", rsp_data);
+    ++fails;
+  } else {
+    std::printf("stall mem (miss/fill): ok, esperó y trajo el dato correcto\n");
+  }
+
+  // --- Estancamiento en mem_bus_if durante un write-back (eviction): dos
+  //     writes más al mismo set fuerzan desalojar addr0 (dirty, recién
+  //     traída arriba) -- igual que la parte 1, pero ahora la "memoria"
+  //     tarda en aceptar el write-back. Confirma que el dato desalojado
+  //     no se pierde aunque el flush se demore.
+  if (!do_write(sim, ticks, mem, kAddr1, kData1, 31, rsp_tag, "[stall] write addr1 (llena la otra vía)")) {
+    std::printf("FAIL: write addr1 (setup stall write-back) nunca respondió\n"); ++fails;
+  }
+  if (!do_write(sim, ticks, mem, kAddr2, kData2, 32, rsp_tag,
+                "[stall] write addr2 (eviction, mem tarda 5 ciclos en aceptar el flush)",
+                /*mem_stall_cycles=*/5)) {
+    std::printf("FAIL: write addr2 (stall de mem en write-back) nunca respondió\n"); ++fails;
+  } else if (!do_read(sim, ticks, mem, kAddr0, 33, rsp_data, rsp_tag,
+                       "[stall] read addr0 (post-eviction, confirma el write-back)")) {
+    std::printf("FAIL: read addr0 (post write-back con stall) nunca respondió\n"); ++fails;
+  } else if (rsp_data != 0) {
+    // addr0 no se reescribió en esta corrida de la parte 3 -- debe seguir
+    // en 0 en la "memoria" de fondo (no se tocó desde el mem.clear()).
+    std::printf("FAIL: read addr0 post write-back con stall trajo 0x%08X, esperado 0x0 "
+                "(el flush se perdió o llegó corrupto)\n", rsp_data);
+    ++fails;
+  } else {
+    std::printf("stall mem (write-back/eviction): ok, el flush sobrevivió el stall\n");
+  }
+
+  // --- Estancamiento en core_bus_if: el consumidor (core) tarda 5 ciclos
+  //     en levantar rsp_ready sobre un read-hit. La cache tiene que
+  //     sostener rsp_valid/rsp_data estables hasta que por fin se acepta.
+  if (!do_read(sim, ticks, mem, kAddr1, 34, rsp_data, rsp_tag,
+               "[stall] read addr1 (hit, core tarda 5 ciclos en aceptar la respuesta)",
+               /*mem_stall_cycles=*/0, /*rsp_stall_cycles=*/5)) {
+    std::printf("FAIL: read addr1 (stall de core en hit) nunca respondió\n"); ++fails;
+  } else if (rsp_data != kData1) {
+    std::printf("FAIL: read addr1 (stall de core en hit) trajo 0x%08X, esperado 0x%08X\n",
+                rsp_data, kData1);
+    ++fails;
+  } else {
+    std::printf("stall core (rsp_ready): ok, la respuesta se sostuvo hasta ser aceptada\n");
   }
 
   if (fails) {
