@@ -141,25 +141,28 @@ module l2_cache import VX_gpu_pkg::*; #(
 
         tag_entry_t tag_array [NUM_SETS][NUM_WAYS];
 
-        for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
-            logic [LINE_BITS-1:0] mem [NUM_SETS];
-        end
+        // --------------------------------------------------------------
+        // Paso 2/3: árbitro round-robin entre los núcleos que apuntan a
+        // ESTE banco. Paso 3 acota el request mask a SOLO escrituras
+        // (writebacks) -- un read todavía no tiene a dónde ir (eso es
+        // paso 4), así que ni se arbitra: queda pendiente en core_bus_if
+        // sin que este banco lo toque. `grant_ready` ahora SÍ depende de
+        // `state == S_IDLE` -- recién acá aparece la FSM que puede estar
+        // "ocupada".
+        // --------------------------------------------------------------
+        typedef enum logic [1:0] { S_IDLE, S_HIT, S_WB } state_t;
+        state_t state;
 
-        // --------------------------------------------------------------
-        // Paso 2: árbitro round-robin entre los núcleos que apuntan a
-        // ESTE banco (`core_bank_flat[c]==b`) este ciclo. `grant_ready`
-        // constante 1 -- todavía no hay FSM que diga "ocupado" (paso 3/4),
-        // así que cada banco siempre puede "aceptar" un ganador nuevo.
-        // --------------------------------------------------------------
         wire [NUM_CORES-1:0] bank_req_mask;
         for (genvar c = 0; c < NUM_CORES; ++c) begin : g_mask
-            assign bank_req_mask[c] = core_req_valid_flat[c] && (core_bank_flat[c] == BANK_BITS'(b));
+            assign bank_req_mask[c] = core_req_valid_flat[c] && core_req_rw_flat[c]
+                                    && (core_bank_flat[c] == BANK_BITS'(b))
+                                    && (state == S_IDLE);
         end
 
         wire                  arb_valid;
         wire [CORE_BITS-1:0]  arb_index;
         wire [NUM_CORES-1:0]  arb_onehot;
-        `UNUSED_VAR (arb_index)
 
         VX_generic_arbiter #(
             .NUM_REQS (NUM_CORES),
@@ -171,11 +174,142 @@ module l2_cache import VX_gpu_pkg::*; #(
             .grant_valid  (arb_valid),
             .grant_index  (arb_index),
             .grant_onehot (arb_onehot),
-            .grant_ready  (1'b1)
+            .grant_ready  (state == S_IDLE)
         );
 
         assign bank_grant_valid[b]  = arb_valid;
         assign bank_grant_onehot[b] = arb_onehot;
+
+        // ---- tag lookup sobre el ganador del arbitraje (combinacional,
+        // mismo patrón que l1_cache.sv) ----
+        wire [SET_BITS-1:0] sel_set = core_set_flat[arb_index];
+        wire [TAG_BITS-1:0] sel_tag = core_tag_flat[arb_index];
+
+        logic [NUM_WAYS-1:0] way_hit;
+        for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_way_cmp
+            assign way_hit[w] = tag_array[sel_set][w].valid
+                              && (tag_array[sel_set][w].tag == sel_tag);
+        end
+
+        wire tag_hit;
+        wire [WAY_BITS-1:0] hit_way;
+        VX_onehot_encoder #(
+            .N (NUM_WAYS)
+        ) hit_way_enc (
+            .data_in   (way_hit),
+            .data_out  (hit_way),
+            .valid_out (tag_hit)
+        );
+
+        // Vía víctima: primera inválida del set, si no hay cae en la vía 0
+        // -- mismo placeholder deliberado que l1_cache.sv (no es LRU/PLRU).
+        logic [WAY_BITS-1:0] victim_way;
+        always_comb begin
+            victim_way = '0;
+            for (int w = 0; w < NUM_WAYS; ++w)
+                if (!tag_array[sel_set][w].valid)
+                    victim_way = w[WAY_BITS-1:0];
+        end
+
+        // ---- registros latcheados al aceptar en S_IDLE ----
+        logic                 req_rw_r;    // paso 3: siempre 1'b1 por ahora (solo writes)
+        logic [WAY_BITS-1:0]  hit_way_r;
+        logic [WAY_BITS-1:0]  victim_way_r;
+        logic [SET_BITS-1:0]  req_set_r;
+        logic [TAG_BITS-1:0]  req_tag_r;
+        logic [LINE_BITS-1:0] req_wdata_r;
+        logic                 tag_hit_r;
+        `UNUSED_VAR (req_rw_r)
+
+        always_ff @(posedge clk) begin
+            if (reset) begin
+                state <= S_IDLE;
+            end else begin
+                case (state)
+                    S_IDLE: begin
+                        if (arb_valid) begin
+                            req_rw_r     <= core_req_rw_flat[arb_index];
+                            req_set_r    <= sel_set;
+                            req_tag_r    <= sel_tag;
+                            req_wdata_r  <= core_req_data_flat[arb_index];
+                            hit_way_r    <= hit_way;
+                            victim_way_r <= victim_way;
+                            tag_hit_r    <= tag_hit;
+                            if (tag_hit) begin
+                                state <= S_HIT;  // write-hit: solo ensucia la línea
+                            end else if (tag_array[sel_set][victim_way].valid
+                                      && tag_array[sel_set][victim_way].dirty) begin
+                                // víctima sucia: hay que desalojarla antes de poder
+                                // asentar la línea nueva -- mecanismo real (hablar con
+                                // mem_bus_if[b]/árbitro global) llega en el paso 5; por
+                                // ahora este estado es un stub estructural.
+                                state <= S_WB;
+                            end else begin
+                                // write-miss directo: el writeback YA trae la línea
+                                // completa, no hace falta ir a buscar nada.
+                                state <= S_HIT;
+                            end
+                        end
+                    end
+                    S_HIT: begin
+                        // write: fire-and-forget, mismo contrato que el resto del
+                        // sistema (ver l1_cache.sv) -- no espera ningún ready.
+                        state <= S_IDLE;
+                    end
+                    S_WB: begin
+                        // TODO (paso 5): volcar data_rd_data[victim_way_r] a
+                        // mem_bus_if[b] antes de pasar a S_HIT. Por ahora, stub.
+                    end
+                    default: state <= S_IDLE;
+                endcase
+            end
+        end
+
+        // ---- tag array: escritura ----
+        always_ff @(posedge clk) begin
+            if (reset) begin
+                for (int s = 0; s < NUM_SETS; ++s)
+                    for (int w = 0; w < NUM_WAYS; ++w)
+                        tag_array[s][w].valid <= 1'b0;
+            end else begin
+                if (state == S_HIT) begin
+                    if (tag_hit_r) begin
+                        // write-hit: el dato ya se escribe vía fsm_data_wr_* más
+                        // abajo -- acá solo hace falta ensuciar la línea.
+                        tag_array[req_set_r][hit_way_r].dirty <= 1'b1;
+                    end else begin
+                        // write-miss directo: asienta la línea nueva completa.
+                        tag_array[req_set_r][victim_way_r].valid <= 1'b1;
+                        tag_array[req_set_r][victim_way_r].dirty <= 1'b1;
+                        tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
+                    end
+                end
+            end
+        end
+
+        // ---- data array: solo el puerto de ESCRITURA por ahora (un
+        // writeback nunca necesita leer nada -- es la línea completa, sin
+        // merge; el puerto de lectura llega en el paso 4, para hits/fills
+        // de lectura). ----
+        logic                  fsm_data_wr_en;
+        logic [WAY_BITS-1:0]   fsm_data_wr_way;
+        logic [SET_BITS-1:0]   fsm_data_wr_set;
+        logic [LINE_BITS-1:0]  fsm_data_wr_line;
+        always_comb begin
+            fsm_data_wr_en   = (state == S_HIT);
+            fsm_data_wr_way  = tag_hit_r ? hit_way_r : victim_way_r;
+            fsm_data_wr_set  = req_set_r;
+            fsm_data_wr_line = req_wdata_r;
+        end
+
+        for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
+            logic [LINE_BITS-1:0] mem [NUM_SETS];
+            wire wr_en = fsm_data_wr_en && (fsm_data_wr_way == w[WAY_BITS-1:0]);
+            always_ff @(posedge clk) begin
+                if (wr_en)
+                    mem[fsm_data_wr_set] <= fsm_data_wr_line;
+            end
+        end
 
     end
 
