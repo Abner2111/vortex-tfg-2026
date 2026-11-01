@@ -1,0 +1,6 @@
+`verilator_config
+
+// Mismo motivo que hw/unittest/l1_cache/waivers.vlt: VX_mem_bus_if.sv es
+// compartido por todo Vortex, así que sus waivers van acá (scoped a este
+// proyecto) en vez de con pragmas inline en el archivo compartido.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
