@@ -16,13 +16,22 @@
 // escritura completo (write-hit, write-miss directo; eviction real todavía
 // stub, ver S_WB) (listo).
 //
-// Paso 4: interfaz hacia L1 para atender misses -- camino de LECTURA.
-// Un read-hit responde directo desde el data array propio del banco
-// (S_HIT, igual mecanismo de latencia de 1 ciclo que ya documentaba
-// l1_cache.sv). Un read-miss entra a S_MISS_WAIT/S_FILL -- la parte real
-// de ir a buscar la línea al árbitro global (mem_bus_if[b]) sigue siendo
-// un stub, igual que S_WB desde el paso 3: eso es el paso 5. Por eso
-// S_MISS_WAIT todavía no completa solo -- es la forma, no el mecanismo.
+// Paso 4: interfaz hacia L1 para atender misses -- camino de LECTURA
+// (hit-read desde el data array propio; S_MISS_WAIT/S_FILL como stub)
+// (listo).
+//
+// Paso 5: interfaz hacia el árbitro global para misses que no encuentra en
+// L2 -- completa S_WB (volcar la víctima sucia) y S_MISS_WAIT (pedir la
+// línea nueva) de verdad contra mem_bus_if[b]. Mismo contrato que
+// l1_cache.sv ya usa para SU propio mem_bus_if (hacia esta misma L2, antes
+// de este paso, y hacia el árbitro global ahora): a diferencia de
+// core_bus_if (donde un write es fire-and-forget, sin respuesta -- ver el
+// fix de A-9 en l1_cache.sv), mem_bus_if SÍ espera `rsp_valid` para
+// CUALQUIER transacción, lectura o escritura -- quien está debajo tiene
+// que confirmar que la escritura realmente se completó antes de que el
+// que la pidió siga adelante. Reconstruye los bits de banco (constantes,
+// `b`) al armar la dirección: tag_r/set_r solos no alcanzan para no
+// colisionar con la misma línea de otro banco.
 `include "VX_define.vh"
 
 /* verilator lint_off UNUSEDSIGNAL */
@@ -219,19 +228,30 @@ module l2_cache import VX_gpu_pkg::*; #(
         logic [WAY_BITS-1:0]       victim_way_r;
         logic [SET_BITS-1:0]       req_set_r;
         logic [TAG_BITS-1:0]       req_tag_r;
+        logic [TAG_BITS-1:0]       victim_tag_r;
         logic [LINE_BITS-1:0]      req_wdata_r;
         logic [CORE_TAG_WIDTH-1:0] req_ctag_r;
         logic                      tag_hit_r;
-        logic [LINE_BITS-1:0]      fetched_line_r;  // paso 5 la llena; acá solo se declara
+        logic [LINE_BITS-1:0]      fetched_line_r;
+        logic                      mem_req_sent_r;  // paso 5: ya mandamos el req a mem_bus_if[b], esperando rsp
 
         // núcleo que ganó este banco y está esperando la respuesta (S_HIT
         // de lectura / S_FILL) -- las escrituras son fire-and-forget y no
         // lo necesitan, pero no cuesta nada latchearlo siempre.
         wire resp_ready_sel = core_rsp_ready_flat[req_core_r];
 
+        // mem_bus_if[b] es un puerto dedicado de este banco (a diferencia
+        // de l1_cache.sv, no hay un segundo camino -- snoop -- compitiendo
+        // por él), así que no hace falta ningún árbitro acá: solo tracking
+        // de "ya mandé el req, esperando la respuesta" para no reafirmar
+        // req_valid de más una vez aceptado.
+        wire mem_req_fire = mem_bus_if[b].req_valid && mem_bus_if[b].req_ready;
+        wire mem_rsp_fire = mem_bus_if[b].rsp_valid && mem_bus_if[b].rsp_ready;
+
         always_ff @(posedge clk) begin
             if (reset) begin
-                state <= S_IDLE;
+                state          <= S_IDLE;
+                mem_req_sent_r <= 1'b0;
             end else begin
                 case (state)
                     S_IDLE: begin
@@ -244,24 +264,19 @@ module l2_cache import VX_gpu_pkg::*; #(
                             req_ctag_r   <= core_req_tag_flat[arb_index];
                             hit_way_r    <= hit_way;
                             victim_way_r <= victim_way;
+                            victim_tag_r <= tag_array[sel_set][victim_way].tag;
                             tag_hit_r    <= tag_hit;
                             if (tag_hit) begin
                                 state <= S_HIT;  // hit (lectura o escritura)
                             end else if (tag_array[sel_set][victim_way].valid
                                       && tag_array[sel_set][victim_way].dirty) begin
-                                // víctima sucia: hay que desalojarla antes de poder
-                                // asentar/traer la línea nueva -- mecanismo real
-                                // (hablar con mem_bus_if[b]/árbitro global) llega en
-                                // el paso 5; por ahora este estado es un stub.
-                                state <= S_WB;
+                                state <= S_WB;  // víctima sucia: desalojarla primero
                             end else if (core_req_rw_flat[arb_index]) begin
                                 // write-miss directo: el writeback YA trae la línea
                                 // completa, no hace falta ir a buscar nada.
                                 state <= S_HIT;
                             end else begin
-                                // read-miss: hay que pedirle la línea al árbitro
-                                // global -- stub, igual que S_WB (paso 5).
-                                state <= S_MISS_WAIT;
+                                state <= S_MISS_WAIT;  // read-miss: pedirla al árbitro global
                             end
                         end
                     end
@@ -272,13 +287,22 @@ module l2_cache import VX_gpu_pkg::*; #(
                             state <= S_IDLE;
                     end
                     S_WB: begin
-                        // TODO (paso 5): volcar data_rd_data[victim_way_r] a
-                        // mem_bus_if[b]; al completar, pasar a S_HIT si lo pendiente
-                        // era un write, o a S_MISS_WAIT si era un read. Por ahora, stub.
+                        if (mem_req_fire) mem_req_sent_r <= 1'b1;
+                        if (mem_rsp_fire) begin
+                            mem_req_sent_r <= 1'b0;
+                            // si lo pendiente era un write, ya tiene los datos
+                            // (req_wdata_r) -- asienta directo; si era un read,
+                            // ahora sí hace falta ir a buscar la línea nueva.
+                            state <= req_rw_r ? S_HIT : S_MISS_WAIT;
+                        end
                     end
                     S_MISS_WAIT: begin
-                        // TODO (paso 5): pedir la línea a mem_bus_if[b]; al llegar,
-                        // latchear fetched_line_r y pasar a S_FILL. Por ahora, stub.
+                        if (mem_req_fire) mem_req_sent_r <= 1'b1;
+                        if (mem_rsp_fire) begin
+                            mem_req_sent_r <= 1'b0;
+                            fetched_line_r <= mem_bus_if[b].rsp_data.data;
+                            state          <= S_FILL;
+                        end
                     end
                     S_FILL: begin
                         if (resp_ready_sel)
@@ -309,8 +333,12 @@ module l2_cache import VX_gpu_pkg::*; #(
                         tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
                     end
                 end
-                // TODO (paso 5): fill de lectura en S_MISS_WAIT -- asienta
-                // valid=1/dirty=0/tag=req_tag_r en victim_way_r, línea limpia.
+                if (state == S_MISS_WAIT && mem_rsp_fire) begin
+                    // fill de lectura: línea limpia recién traída del árbitro global.
+                    tag_array[req_set_r][victim_way_r].valid <= 1'b1;
+                    tag_array[req_set_r][victim_way_r].dirty <= 1'b0;
+                    tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
+                end
             end
         end
 
@@ -324,10 +352,21 @@ module l2_cache import VX_gpu_pkg::*; #(
         logic [SET_BITS-1:0]   fsm_data_wr_set;
         logic [LINE_BITS-1:0]  fsm_data_wr_line;
         always_comb begin
-            fsm_data_wr_en   = (state == S_HIT) && req_rw_r;
+            fsm_data_wr_en   = 1'b0;
             fsm_data_wr_way  = tag_hit_r ? hit_way_r : victim_way_r;
             fsm_data_wr_set  = req_set_r;
             fsm_data_wr_line = req_wdata_r;
+            if (state == S_HIT && req_rw_r) begin
+                fsm_data_wr_en = 1'b1;
+            end else if (state == S_MISS_WAIT && mem_rsp_fire) begin
+                // fill de lectura: la línea recién llegada del árbitro
+                // global también tiene que asentarse en el data array --
+                // si no, el tag_array dice "válida" pero la próxima
+                // lectura (ya un hit) lee lo que hubiera antes ahí.
+                fsm_data_wr_en   = 1'b1;
+                fsm_data_wr_way  = victim_way_r;
+                fsm_data_wr_line = mem_bus_if[b].rsp_data.data;
+            end
         end
 
         // Fuera de S_IDLE, releer siempre el set con el que se aceptó la
@@ -353,6 +392,25 @@ module l2_cache import VX_gpu_pkg::*; #(
         assign bank_resp_core[b]  = req_core_r;
         assign bank_resp_data[b]  = (state == S_HIT) ? data_rd_data[hit_way_r] : fetched_line_r;
         assign bank_resp_ctag[b]  = req_ctag_r;
+
+        // ---- puerto propio hacia mem_bus_if[b] (árbitro global) ----
+        // Dirección: reinserta los bits de banco (constantes, `b`) para
+        // reconstruir la dirección GLOBAL de línea -- tag/set por sí solos
+        // colisionarían con la misma línea servida por OTRO banco. En
+        // S_WB es la dirección VIEJA (la víctima); en S_MISS_WAIT, la NUEVA.
+        assign mem_bus_if[b].req_valid      = ((state == S_WB) || (state == S_MISS_WAIT)) && !mem_req_sent_r;
+        assign mem_bus_if[b].req_data.rw    = (state == S_WB);
+        assign mem_bus_if[b].req_data.addr  = (state == S_WB)
+                                             ? {victim_tag_r, req_set_r, BANK_BITS'(b)}
+                                             : {req_tag_r,    req_set_r, BANK_BITS'(b)};
+        assign mem_bus_if[b].req_data.data  = data_rd_data[victim_way_r];  // solo se usa en S_WB
+        assign mem_bus_if[b].req_data.byteen = '1;
+        assign mem_bus_if[b].req_data.attr   = '0;
+        // TODO (igual que l1_cache.sv): con más de un miss en vuelo por
+        // banco haría falta un tag real -- un solo request a la vez por
+        // banco alcanza con 0.
+        assign mem_bus_if[b].req_data.tag    = '0;
+        assign mem_bus_if[b].rsp_ready       = (state == S_WB) || (state == S_MISS_WAIT);
 
     end
 

@@ -10,8 +10,8 @@
 # Add a DUT: append its name to DUTS and define the five variables. No new
 # directory, no dispatcher edit.
 
-DUTS := cache core cp dxa fpu gfx issue lmem mem_unit om raster rtu \
-        scope tcu tensor tex top unittest vm vortex
+DUTS := cache core cp dxa fpu gfx issue l1_cache lmem mem_unit om raster rtu \
+        scope snoop_bus tcu tensor tex top unittest vm vortex
 
 # ---------------------------------------------------------------------------
 # shared include fragments
@@ -80,6 +80,11 @@ gfx_PKG  = $(RTL_DIR)/fpu/VX_fpu_pkg.sv $(RTL_DIR)/dxa/VX_dxa_pkg.sv $(RTL_DIR)/
 issue_PRJ := VX_issue_top
 issue_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm $(FPU_INC) -I$(UNITTEST_DIR)/issue
 
+# TFG: l1_cache.sv, ver hw/rtl/tfg_l1/l1_cache.sv y
+# docs/proposals/tfg_l1_cache_implementation.md.
+l1_cache_PRJ := VX_l1_cache_top
+l1_cache_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/tfg_l1 -I$(UNITTEST_DIR)/l1_cache
+
 lmem_PRJ := VX_local_mem_top
 lmem_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(UNITTEST_DIR)/local_mem
 
@@ -105,6 +110,11 @@ rtu_PKG  = $(RTL_DIR)/fpu/VX_fpu_pkg.sv $(RTL_DIR)/rtu/VX_rtu_pkg.sv
 # The only DUT that does not want -I$(RTL_DIR)/interfaces.
 scope_PRJ := VX_scope_tap
 scope_INC  = -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(RTL_DIR) -I$(RTL_DIR)/libs
+
+# TFG: snoop_bus.sv, dos l1_cache.sv reales conectados -- ver
+# hw/rtl/tfg_l1/snoop_bus.sv y docs/proposals/tfg_mesi_coherence_design.md.
+snoop_bus_PRJ := VX_snoop_bus_top
+snoop_bus_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/tfg_l1 -I$(UNITTEST_DIR)/snoop_bus
 
 tcu_PRJ := VX_tcu_unit_top
 tcu_IP  := 1

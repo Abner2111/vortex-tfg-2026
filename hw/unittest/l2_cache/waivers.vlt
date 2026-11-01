@@ -1,0 +1,8 @@
+`verilator_config
+
+// l2_cache.sv no usa el campo attr de VX_mem_bus_if (no hace falta para
+// esta L2 -- cada transacción core_bus_if es una línea completa, sin
+// atributos adicionales). Waiver scoped a este proyecto únicamente --
+// VX_mem_bus_if.sv es compartido por todo Vortex, así que no se le
+// agregan pragmas inline.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
