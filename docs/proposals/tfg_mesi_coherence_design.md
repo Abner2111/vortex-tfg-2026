@@ -1,7 +1,7 @@
-# Diseño de la máquina de estados MESI por línea (A-6) + interconexión (A-7)
+# Diseño de la máquina de estados MESI por línea (A-6) + interconexión (A-7) + integración del snooping (A-8)
 
-**Status: A-6 y A-7 implementados y probados end-to-end.** Este documento
-cubre dos actividades del anteproyecto:
+**Status: A-6, A-7 y A-8 implementados y probados end-to-end.** Este
+documento cubre tres actividades del anteproyecto:
 - **A-6**: diseñar la FSM MESI, modelar las 5 transiciones pedidas, y
   documentar la tabla completa para validarla contra A-11. Las 5
   transiciones (I→E, I→S, E→S, S→I, M→E) están implementadas en
@@ -9,14 +9,19 @@ cubre dos actividades del anteproyecto:
 - **A-7**: `snoop_bus.sv`, la interconexión entre L1 — arbitraje,
   propagación de invalidaciones/upgrades, señal de hit remoto, probado con
   2 `l1_cache` reales conectados. Ver §8.
+- **A-8**: conectar `snoop_bus.sv` a la FSM MESI de forma que un L1 pueda
+  atender un snoop remoto *mientras* tiene su propio miss/upgrade en
+  vuelo — resuelve el deadlock cruzado que A-7 había dejado documentado
+  como límite conocido. Ver §9.
 
-Ambas partes están probadas: `hw/unittest/l1_cache` (un L1 aislado,
-snoop_bus_if atado a mano) y `hw/unittest/snoop_bus` (2 L1 reales + el bus
-real). Queda un límite conocido de diseño (deadlock cruzado bajo
-contención simultánea de ambos lados) documentado en §8 — no bloquea el
-uso normal, pero conviene tenerlo presente para A-11.
+Todo está probado: `hw/unittest/l1_cache` (un L1 aislado, snoop_bus_if
+atado a mano) y `hw/unittest/snoop_bus` (2 L1 reales + el bus real,
+incluyendo el escenario que antes colgaba). Queda una condición de carrera
+residual mucho más angosta (colisión exacta de dirección entre un snoop
+remoto y una operación local, no solo de timing) documentada en §9.4 — no
+resuelta a propósito en esta pasada, ver por qué.
 
-**Rama:** `l1_cache/mesi_fsm`, sobre `l1_cache/definition_and_interfaces`.
+**Rama:** `l1_cache/a8-snoop-integration`, sobre `l1_cache/mesi_fsm`.
 
 ---
 
@@ -355,3 +360,123 @@ mockeado):
 mock), las transiciones E→S y M→E→S ya probadas en aislamiento en A-6, y
 además el upgrade S→M, la invalidación en un write-miss, y el arbitraje
 del §8.3 — todo de punta a punta.
+
+## 9. Integrar el controlador de snooping en la FSM MESI (A-8)
+
+### 9.1 El problema: una sola FSM no puede hacer las dos cosas a la vez
+
+Hasta A-7, `l1_cache.sv` tenía **un solo registro `state`** manejando todo:
+el camino local (pipeline ↔ L1 ↔ L2) y el camino de responder a snoops
+remotos compartían la misma máquina de estados. Eso significaba que
+mientras `state` estaba en `S_SNOOP_WB`/`S_SNOOP_POST_WB`/`S_SNOOP_HIT`/
+`S_SNOOP_DONE` (respondiendo un snoop) o en `S_SNOOP_QUERY` (esperando el
+turno del árbitro para SU PROPIA consulta), el L1 **no podía** hacer la
+otra cosa — literal, el `case (state)` solo puede estar en un estado a la
+vez.
+
+El síntoma ya estaba documentado desde A-7 (§8.4, ahora obsoleto, ver
+abajo): si dos L1 entraban a `S_SNOOP_QUERY` en el mismo ciclo (cada uno
+queriendo consultar por su cuenta), cada uno quedaba esperando que el
+árbitro lo atendiera — pero ninguno podía atender el snoop del otro
+porque esa lógica solo corría en `S_IDLE`, y ninguno volvía a `S_IDLE`
+hasta que el árbitro lo atendiera. Deadlock cruzado.
+
+### 9.2 La solución: dos FSM independientes
+
+`l1_cache.sv` ahora tiene dos registros de estado separados:
+
+- **`state`** (`S_IDLE, S_HIT, S_WB, S_SNOOP_QUERY, S_MISS_WAIT, S_FILL`):
+  el camino local, sin cambios de comportamiento respecto a A-7 salvo que
+  ya no tiene los 4 estados de snoop mezclados adentro.
+- **`snp_state`** (`SNP_IDLE, SNP_WB, SNP_POST_WB, SNP_HIT, SNP_DONE`):
+  el camino de responder snoops remotos — es literalmente el mismo código
+  que antes vivía dentro de `S_IDLE`/`S_SNOOP_WB`/etc., movido a su propio
+  `always_ff`, corriendo en paralelo.
+
+Las dos corren **todos los ciclos, simultáneamente**, cada una en su
+propio `case`. Esto es lo que resuelve el deadlock: mientras `state` está
+en `S_SNOOP_QUERY` esperando su propio turno del árbitro, `snp_state`
+sigue libre para atender cualquier snoop remoto que llegue — incluyendo,
+justamente, el snoop del L1 con el que se estaba bloqueado antes.
+
+`core_bus_if.req_ready` se simplificó de `(state==S_IDLE) &&
+!snoop_any_hit` a simplemente `(state==S_IDLE)` — aceptar una petición
+local nueva ya no tiene por qué esperar a que se resuelva un snoop
+remoto, porque ya no comparten registro de estado.
+
+### 9.3 Lo que las dos FSM siguen necesitando compartir
+
+Separar los *estados* fue la parte fácil. Dos recursos físicos seguían
+siendo compartidos, y ahí es donde apareció el verdadero trabajo de
+"integración":
+
+**mem_bus_if** (un solo puerto hacia la L2). Antes, con una sola FSM,
+nunca había dos peticiones a mem_bus_if compitiendo al mismo tiempo — era
+literalmente imposible. Con las FSM separadas, el camino local (`S_WB`/
+`S_MISS_WAIT`) y el de snoop (`SNP_WB`, cuando toca flushear una línea M
+por un snoop remoto) sí pueden necesitarlo al mismo tiempo. Se agregó un
+arbitrito interno chico, `mem_owner_r` (`MEM_NONE`/`MEM_CORE`/
+`MEM_SNOOP`), que concede el puerto a uno de los dos y no lo suelta hasta
+que esa transacción completa (mismo patrón que `snoop_bus.sv` usa para
+sus sesiones de broadcast). Prioridad fija a favor del snoop — un remoto
+ya está esperando la respuesta (y probablemente bloqueando a otros via el
+árbitro de A-7), mientras que el peor caso para el camino local es una
+espera un poco más larga. `ponytail:` prioridad fija en vez de
+round-robin — si esto genera starvation medible del camino local, revisar.
+
+**El puerto de lectura del data array.** Este fue el hallazgo no obvio de
+esta actividad: al separar las FSM, `array_set_addr` (la dirección que se
+le da al data array cada ciclo) pasó a tener DOS dueños potenciales
+compitiendo por el mismo puerto único de lectura — si uno le "robaba" el
+puerto al otro por un solo ciclo mientras el otro tenía un `S_WB`/`SNP_WB`
+en curso, `data_rd_data`/lo que se lee quedaba corrompido exactamente
+igual que describe el bug de A-5 (`data_rd_data` corriéndose un ciclo). En
+vez de arbitrar un recurso compartido más (y arriesgar otra carrera sutil
+de timing, que es exactamente el tipo de bug que este proyecto ya pisó
+varias veces), se le dio al lado snoop **su propio puerto de lectura**
+independiente (`snoop_rd_data`, indexado por `snoop_array_set_addr`). Es
+una BRAM de 2 puertos de lectura (o 1R+1W) — un primitivo estándar y
+barato en FPGA/ASIC (Xilinx, Yosys lo soportan nativamente), no un truco
+inventado para esquivar el problema. Esto eliminó la clase entera de bugs
+de "quién tiene el puerto este ciclo" en vez de intentar arbitrarla.
+
+**tag_array** sigue en un solo `always_ff` (obligatorio: dos bloques
+separados escribiendo la misma variable no es válido en SV), con las
+condiciones de cada lado ahora usando `state==...` o `snp_state==...`
+según corresponda — ver §9.4 para la carrera residual que esto deja
+abierta.
+
+### 9.4 Condición de carrera residual (documentada, no resuelta)
+
+Si un snoop remoto y una operación local coinciden **en la línea exacta**
+(mismo set y vía) en el mismo ciclo, las dos escrituras a `tag_array`
+(una desde el bloque gateado por `state`, otra desde el gateado por
+`snp_state`) compiten dentro del mismo `always_ff` — la que está más
+abajo en el código gana (last-write-wins de SystemVerilog). No es el
+deadlock que A-8 pedía resolver (que era puramente de *timing*, sin
+importar la dirección) — esta es una colisión de *dirección exacta*,
+mucho más angosta y menos probable en la práctica.
+
+Arreglarla bien necesita algo al estilo MSHR (miss status holding
+register): un candado por línea que, cuando el camino local elige una vía
+víctima o el camino de snoop decide flushear una, bloquee al otro lado de
+tocar esa misma entrada hasta que la transacción en curso termine
+(diferir el snoop unos ciclos en vez de dejarlo competir). Es un cambio de
+otro tamaño — no se metió en esta pasada porque exactamente ese tipo de
+apuro ("meter un fix chico encima de un problema grande sin poder
+probarlo bien") es lo que ya causó los bugs de timing documentados en §7 y
+en `tfg_l1_cache_implementation.md`. Queda como candidato a revisar antes
+de A-11 si las pruebas de coherencia necesitan garantizar esto.
+
+### 9.5 Test: el escenario que antes colgaba, ahora resuelve
+
+Se agregó un escenario nuevo a `hw/unittest/snoop_bus/main.cpp`
+("Escenario 6"): los dos L1 piden un miss de escritura sobre direcciones
+**sin relación entre sí**, en el **mismo ciclo exacto** — reproduciendo
+literalmente la condición que antes de A-8 hacía que el test de
+arbitraje colgara (ni con 200 ciclos de margen resolvía; por eso el
+escenario de arbitraje de A-7 tuvo que desfasar a propósito las dos
+peticiones, ver §8.5). Con las FSM separadas, el mismo escenario ahora
+resuelve limpio y cada L1 recupera su propio dato sin cruzarse con el del
+otro. `PASSED (134 ticks)` para la suite completa (antes 96, con este
+escenario nuevo sumado).

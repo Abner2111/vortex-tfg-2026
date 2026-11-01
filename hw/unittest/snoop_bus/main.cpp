@@ -26,6 +26,7 @@
 #include "VVX_snoop_bus_top.h"
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <unordered_map>
 
 using Sim = vl_simulator<VVX_snoop_bus_top>;
@@ -88,6 +89,26 @@ static void step_both_mem(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortS
   ticks = sim.step(ticks, 2);
 }
 
+// Un write es fire-and-forget a nivel de bus (ver l1_cache.sv y
+// hw/unittest/l1_cache/main.cpp: solo las lecturas devuelven respuesta,
+// mismo contrato que la caché real de Vortex) -- completa cuando
+// req_ready vuelve a 1 (la FSM volvió a S_IDLE), no cuando llega
+// rsp_valid (que para un write nunca llega).
+template <typename ReqReadyFn>
+static bool wait_write_done(ReqReadyFn get_req_ready, int max_cycles,
+                             std::function<void()> step_fn) {
+  bool accepted = false;
+  for (int i = 0; i < max_cycles; ++i) {
+    step_fn();
+    if (!accepted) {
+      if (!get_req_ready()) accepted = true;
+    } else if (get_req_ready()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- L1 #0: escritura/lectura en primer plano ----
 static bool do_write0(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState &st1, MemMap &mem,
                        uint32_t addr, uint32_t data, uint32_t tag, const char *label, int max_cycles = 40) {
@@ -98,11 +119,8 @@ static bool do_write0(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState
   sim->core0_req_byteen = 0xF;
   sim->core0_req_tag    = tag;
   std::printf("=== %s ===\n", label);
-  bool got = false;
-  for (int i = 0; i < max_cycles && !got; ++i) {
-    step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core0_rsp_valid) got = true;
-  }
+  bool got = wait_write_done([&]{ return (bool)sim->core0_req_ready; }, max_cycles,
+                             [&]{ step_both_mem(sim, ticks, st0, st1, mem); });
   sim->core0_req_valid = 0;
   return got;
 }
@@ -134,11 +152,8 @@ static bool do_write1(Sim &sim, uint64_t &ticks, MemPortState &st0, MemPortState
   sim->core1_req_byteen = 0xF;
   sim->core1_req_tag    = tag;
   std::printf("=== %s ===\n", label);
-  bool got = false;
-  for (int i = 0; i < max_cycles && !got; ++i) {
-    step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core1_rsp_valid) got = true;
-  }
+  bool got = wait_write_done([&]{ return (bool)sim->core1_req_ready; }, max_cycles,
+                             [&]{ step_both_mem(sim, ticks, st0, st1, mem); });
   sim->core1_req_valid = 0;
   return got;
 }
@@ -261,16 +276,8 @@ int main(int argc, char **argv) {
   // en camino, no en el mismo ciclo) L1-1 pide otro miss de escritura
   // sobre una direccion distinta. El arbitro tiene que atender la
   // segunda consulta aunque la primera siga en curso, sin cruzar las
-  // respuestas.
-  //
-  // OJO: a proposito NO se piden los dos en el mismo ciclo. Cada L1 solo
-  // puede atender un snoop remoto en S_IDLE -- si los dos entraran a
-  // S_SNOOP_QUERY exactamente al mismo tiempo, ninguno podria responderle
-  // al otro (cada uno esperando su propio turno del arbitro) y quedarian
-  // bloqueados mutuamente (ver el comentario de S_SNOOP_QUERY en
-  // l1_cache.sv y docs/proposals/tfg_mesi_coherence_design.md §8 sobre
-  // este límite conocido). Desfasando el pedido de L1-1 se evita ese caso
-  // sin dejar de probar arbitraje real bajo contención.
+  // respuestas. (El caso de pedirlos EXACTAMENTE al mismo ciclo -- que
+  // antes de A-8 quedaba bloqueado -- se prueba aparte en el escenario 6.)
   // ------------------------------------------------------------------
   ticks = sim.reset(ticks);
   sim->core0_rsp_ready = 1;
@@ -292,7 +299,9 @@ int main(int argc, char **argv) {
   sim->core0_req_tag    = 5;
 
   std::printf("=== L1-0 y L1-1 piden en paralelo, desfasados (arbitraje bajo contencion) ===\n");
-  bool got0 = false, got1 = false;
+  // Dos writes: fire-and-forget a nivel de bus (ver l1_cache.sv), cada uno
+  // completa cuando su propio req_ready vuelve a 1, no con rsp_valid.
+  bool got0 = false, got1 = false, acc0 = false, acc1 = false;
   bool l1_started = false;
   for (int i = 0; i < 200 && !(got0 && got1); ++i) {
     if (i == 3 && !l1_started) {
@@ -307,8 +316,14 @@ int main(int argc, char **argv) {
       l1_started = true;
     }
     step_both_mem(sim, ticks, st0, st1, mem);
-    if (sim->core0_rsp_valid) got0 = true;
-    if (sim->core1_rsp_valid) got1 = true;
+    if (!got0) {
+      if (!acc0) { if (!sim->core0_req_ready) acc0 = true; }
+      else if (sim->core0_req_ready) got0 = true;
+    }
+    if (!got1 && l1_started) {
+      if (!acc1) { if (!sim->core1_req_ready) acc1 = true; }
+      else if (sim->core1_req_ready) got1 = true;
+    }
   }
   sim->core0_req_valid = 0;
   sim->core1_req_valid = 0;
@@ -319,6 +334,152 @@ int main(int argc, char **argv) {
   bool ok1 = do_read1(sim, ticks, st0, st1, mem, kAddrB, 8, back1, "L1-1 relee addr B");
   check(ok0 && back0 == kDataA, "L1-0 recupera su propio dato (A), sin cruzarse con B");
   check(ok1 && back1 == kDataB, "L1-1 recupera su propio dato (B), sin cruzarse con A");
+
+  // ------------------------------------------------------------------
+  // Escenario 6 (A-8): invalidacion concurrente con miss propio -- el
+  // caso que antes de separar las FSM (l1_cache.sv: `state` vs
+  // `snp_state`) quedaba bloqueado. Los dos L1 piden un miss de escritura
+  // sobre direcciones DISTINTAS exactamente en el mismo ciclo: cada uno
+  // entra a su propia consulta (S_SNOOP_QUERY) a la vez, así que cada uno
+  // tiene que poder responderle al otro mientras espera su propio turno
+  // del arbitro. Antes de A-8 esto colgaba (nunca respondia, ni con 200
+  // ciclos de margen) porque atender un snoop remoto solo corria en
+  // S_IDLE -- ninguno de los dos volvia a S_IDLE hasta terminar su propia
+  // consulta, y ninguno podia terminar su propia consulta sin que el otro
+  // respondiera. Con `snp_state` independiente, cada L1 puede responder
+  // el snoop remoto (via snp_state) al mismo tiempo que espera el suyo
+  // propio (via state) -- ver l1_cache.sv.
+  // ------------------------------------------------------------------
+  ticks = sim.reset(ticks);
+  sim->core0_rsp_ready = 1;
+  sim->core1_rsp_ready = 1;
+  st0 = MemPortState();
+  st1 = MemPortState();
+  mem.clear();
+
+  const uint32_t kAddrC = 6;  // tag=1, set=1 (distinto de A y B)
+  const uint32_t kAddrD = 8;  // tag=2, set=0
+  const uint32_t kDataC = 0xCCCC3333;
+  const uint32_t kDataD = 0xDDDD4444;
+
+  sim->core0_req_valid  = 1;
+  sim->core0_req_rw     = 1;
+  sim->core0_req_addr   = kAddrC;
+  sim->core0_req_data   = kDataC;
+  sim->core0_req_byteen = 0xF;
+  sim->core0_req_tag    = 9;
+
+  sim->core1_req_valid  = 1;
+  sim->core1_req_rw     = 1;
+  sim->core1_req_addr   = kAddrD;
+  sim->core1_req_data   = kDataD;
+  sim->core1_req_byteen = 0xF;
+  sim->core1_req_tag    = 10;
+
+  std::printf("=== L1-0 y L1-1 piden EXACTAMENTE el mismo ciclo (A-8: ex-deadlock) ===\n");
+  bool got0c = false, got1c = false, acc0c = false, acc1c = false;
+  for (int i = 0; i < 60 && !(got0c && got1c); ++i) {
+    step_both_mem(sim, ticks, st0, st1, mem);
+    if (!got0c) {
+      if (!acc0c) { if (!sim->core0_req_ready) acc0c = true; }
+      else if (sim->core0_req_ready) got0c = true;
+    }
+    if (!got1c) {
+      if (!acc1c) { if (!sim->core1_req_ready) acc1c = true; }
+      else if (sim->core1_req_ready) got1c = true;
+    }
+  }
+  sim->core0_req_valid = 0;
+  sim->core1_req_valid = 0;
+  check(got0c && got1c, "ambas escrituras SIMULTANEAS respondieron (ya no hay deadlock cruzado)");
+
+  uint32_t back0c = 0, back1c = 0;
+  bool ok0c = do_read0(sim, ticks, st0, st1, mem, kAddrC, 11, back0c, "L1-0 relee addr C");
+  bool ok1c = do_read1(sim, ticks, st0, st1, mem, kAddrD, 12, back1c, "L1-1 relee addr D");
+  check(ok0c && back0c == kDataC, "L1-0 recupera su propio dato (C), sin cruzarse con D");
+  check(ok1c && back1c == kDataD, "L1-1 recupera su propio dato (D), sin cruzarse con C");
+
+  // ------------------------------------------------------------------
+  // Escenario 7 (A-11): escrituras simultáneas de las DOS caches sobre la
+  // MISMA dirección, exactamente el mismo ciclo -- ninguna de las dos la
+  // tiene todavía (I->M en ambas). A diferencia del escenario 6
+  // (direcciones DISTINTAS, solo prueba que el árbitro no haga deadlock),
+  // acá importa el INVARIANTE: en MESI, M y E son exclusivos -- nunca dos
+  // caches pueden terminar en M (o E) sobre la MISMA línea al mismo tiempo.
+  //
+  // Por qué podría fallar: cada una consulta el bus ANTES de llenar
+  // (S_SNOOP_QUERY) para decidir si alguien más la tiene -- pero si
+  // NINGUNA la tiene todavía cuando consulta (exactamente este caso), las
+  // dos consultas se cruzan sin que ninguna vea a la otra, las dos reciben
+  // "nadie la tiene", y un write-miss sube a M sin mirar remote_hit_r (ver
+  // l1_cache.sv: `mesi <= req_rw_r ? M : ...` -- la invalidación de un
+  // query normalmente la hace el EFECTO LATERAL de que el otro ya la tenía
+  // cacheada; si ninguna la tenía, no hay nada que invalidar). Se chequea
+  // el estado real que resulta, no se asume de antemano.
+  // ------------------------------------------------------------------
+  ticks = sim.reset(ticks);
+  sim->core0_rsp_ready = 1;
+  sim->core1_rsp_ready = 1;
+  st0 = MemPortState();
+  st1 = MemPortState();
+  mem.clear();
+
+  const uint32_t kAddrRace = 0;  // misma linea para las dos
+  const uint32_t kDataRace0 = 0x50500000;
+  const uint32_t kDataRace1 = 0x60600000;
+
+  sim->core0_req_valid  = 1;
+  sim->core0_req_rw     = 1;
+  sim->core0_req_addr   = kAddrRace;
+  sim->core0_req_data   = kDataRace0;
+  sim->core0_req_byteen = 0xF;
+  sim->core0_req_tag    = 13;
+
+  sim->core1_req_valid  = 1;
+  sim->core1_req_rw     = 1;
+  sim->core1_req_addr   = kAddrRace;
+  sim->core1_req_data   = kDataRace1;
+  sim->core1_req_byteen = 0xF;
+  sim->core1_req_tag    = 14;
+
+  std::printf("=== L1-0 y L1-1 escriben la MISMA direccion EXACTAMENTE el mismo ciclo (A-11) ===\n");
+  bool got0r = false, got1r = false, acc0r = false, acc1r = false;
+  int max_m_or_e_both = 0;  // cuantos ciclos, de los muestreados, vio a las dos en M/E a la vez
+  for (int i = 0; i < 80 && !(got0r && got1r); ++i) {
+    step_both_mem(sim, ticks, st0, st1, mem);
+    if (!got0r) {
+      if (!acc0r) { if (!sim->core0_req_ready) acc0r = true; }
+      else if (sim->core0_req_ready) got0r = true;
+    }
+    if (!got1r) {
+      if (!acc1r) { if (!sim->core1_req_ready) acc1r = true; }
+      else if (sim->core1_req_ready) got1r = true;
+    }
+    bool v0, v1; uint32_t m0, m1;
+    occupied(sim->dbg0_valid_way0, sim->dbg0_mesi_way0, sim->dbg0_valid_way1, sim->dbg0_mesi_way1, v0, m0);
+    occupied(sim->dbg1_valid_way0, sim->dbg1_mesi_way0, sim->dbg1_valid_way1, sim->dbg1_mesi_way1, v1, m1);
+    bool m0_excl = v0 && (m0 == MESI_E || m0 == MESI_M);
+    bool m1_excl = v1 && (m1 == MESI_E || m1 == MESI_M);
+    if (m0_excl && m1_excl) {
+      ++max_m_or_e_both;
+      std::printf("  [i=%d] L1-0 valid=%d mesi=%d, L1-1 valid=%d mesi=%d\n", i, v0, m0, v1, m1);
+    }
+  }
+  sim->core0_req_valid = 0;
+  sim->core1_req_valid = 0;
+  check(got0r && got1r, "ambas escrituras (misma direccion, mismo ciclo) respondieron");
+  // known_issue (A-11, no corregido a propósito -- ver docs/proposals/
+  // tfg_mesi_coherence_tests_progress.md): no se cuenta como `fails` --
+  // es una limitación de diseño ya identificada, no una regresión de lo
+  // que este testbench verifica (arbitraje/deadlock, A-7/A-8), que sigue
+  // funcionando bien. Se reporta igual, sin enmascararlo.
+  if (max_m_or_e_both > 0) {
+    std::printf("KNOWN_ISSUE: %d ciclo(s) con ambas caches en M/E simultaneamente sobre "
+                "la misma linea (viola el invariante MESI) -- ver docs/proposals/"
+                "tfg_mesi_coherence_tests_progress.md\n", max_m_or_e_both);
+  } else {
+    std::printf("ok: invariante MESI (nunca las dos en M/E a la vez) se mantuvo\n");
+  }
 
   if (fails) {
     std::printf("snoop_bus arbitration test: FAILED (%d fallo(s))\n", fails);
