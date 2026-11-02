@@ -1,0 +1,13 @@
+`verilator_config
+
+// Mismo waiver preexistente que ya necesitaba hw/unittest/core (A-9) --
+// VX_mem_bus_if.sv es compartido por todo Vortex, el waiver va acá
+// (scoped a este proyecto) en vez de con pragmas inline en el archivo
+// compartido.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
+
+// gbar_bus_if queda atado en reposo (este programa de prueba no usa
+// barreras globales, igual que A-9) -- a diferencia de A-9 (una sola
+// instancia), acá es un array (una por núcleo), y Verilator reporta
+// unused distinto para ese caso.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_gbar_bus_if.sv"
