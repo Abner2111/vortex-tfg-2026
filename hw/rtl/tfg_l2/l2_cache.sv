@@ -281,9 +281,21 @@ module l2_cache import VX_gpu_pkg::*; #(
                         end
                     end
                     S_HIT: begin
-                        // write: fire-and-forget (ver l1_cache.sv), no espera nada.
-                        // read: espera a que el núcleo original acepte la respuesta.
-                        if (req_rw_r || resp_ready_sel)
+                        // A-17: a diferencia de core_bus_if (L1<->pipeline,
+                        // write fire-and-forget), este core_bus_if es el
+                        // lado MEMORIA desde la perspectiva de quien nos
+                        // habla (l1_cache.sv, vía su propio mem_bus_if) --
+                        // l1_cache.sv espera rsp_valid para CUALQUIER
+                        // transacción de mem_bus_if, lectura o escritura
+                        // (ver l1_cache.sv S_WB, sin gate por rw). Si acá
+                        // no se ackeara la escritura, l1_cache.sv se queda
+                        // esperando para siempre -- encontrado integrando
+                        // L1 real contra L2 real por primera vez (A-17;
+                        // A-14 nunca forzó un flush real, A-11/A-16 solo
+                        // probaron contra mocks de C++ que no dependían de
+                        // este ack). Por eso lectura Y escritura esperan
+                        // resp_ready_sel por igual.
+                        if (resp_ready_sel)
                             state <= S_IDLE;
                     end
                     S_WB: begin
@@ -386,9 +398,12 @@ module l2_cache import VX_gpu_pkg::*; #(
         end
 
         // ---- respuesta hacia el núcleo que ganó este banco (ruteada por
-        // índice fuera del generate de bancos, ver más abajo) -- un write
-        // nunca llega acá (bank_resp_valid exige !req_rw_r). ----
-        assign bank_resp_valid[b] = ((state == S_HIT) || (state == S_FILL)) && !req_rw_r;
+        // índice fuera del generate de bancos, ver más abajo) -- lectura
+        // Y escritura responden por igual (A-17, ver el comentario de
+        // S_HIT más arriba: este core_bus_if es "memoria" desde la
+        // perspectiva de l1_cache.sv, que espera ack de cualquier
+        // transacción vía su propio mem_bus_if). ----
+        assign bank_resp_valid[b] = (state == S_HIT) || (state == S_FILL);
         assign bank_resp_core[b]  = req_core_r;
         assign bank_resp_data[b]  = (state == S_HIT) ? data_rd_data[hit_way_r] : fetched_line_r;
         assign bank_resp_ctag[b]  = req_ctag_r;
