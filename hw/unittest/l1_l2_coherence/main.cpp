@@ -69,16 +69,29 @@ static void service_mem_port(MemPortState &st, uint8_t req_valid, uint32_t req_a
         st.cap_rw    = req_rw;
         st.cap_wdata = req_data;
         st.phase     = DELAY;
+        // Memoria real (sim/rtlsim/processor.cpp) escribe *ram_ en el
+        // mismo ciclo que acepta el request, no cuando arma la
+        // respuesta (confirmado en Fase B) -- ver el mismo fix en
+        // hw/unittest/l2_cache/main.cpp.
+        if (req_rw) mem[req_addr] = req_data;
       }
       break;
     case DELAY: {
       req_ready = 0;
-      if (st.cap_rw) mem[st.cap_addr] = st.cap_wdata;
-      auto it   = mem.find(st.cap_addr);
-      rsp_valid = 1;
-      rsp_data  = (it != mem.end()) ? it->second : 0;
-      rsp_tag   = 0;
-      st.phase  = RESPONDING;
+      if (st.cap_rw) {
+        // Memoria real NUNCA levanta rsp_valid para una escritura --
+        // fire-and-forget de verdad. Ackearla igual (como antes) podía
+        // confundirse con la respuesta de la transacción SIGUIENTE una
+        // vez que l2_cache.sv avanza sin esperar este ack (mismo fix de
+        // Fase B) -- ver el mismo fix en hw/unittest/l2_cache/main.cpp.
+        st.phase = WAIT_REQ;
+      } else {
+        auto it   = mem.find(st.cap_addr);
+        rsp_valid = 1;
+        rsp_data  = (it != mem.end()) ? it->second : 0;
+        rsp_tag   = 0;
+        st.phase  = RESPONDING;
+      }
       break;
     }
     case RESPONDING:

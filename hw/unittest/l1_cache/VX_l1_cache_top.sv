@@ -88,7 +88,7 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
     output wire                        dbg_valid_way0,
     output wire [1:0]                  dbg_mesi_way1,
     output wire                        dbg_valid_way1,
-    output wire [2:0]                  dbg_state,
+    output wire [3:0]                  dbg_state,
     output wire [2:0]                  dbg_snp_state,
     output wire                        dbg_snoop_tag_hit,
     output wire                        dbg_snoop_hit_way

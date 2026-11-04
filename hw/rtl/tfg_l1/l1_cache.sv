@@ -172,6 +172,12 @@ module l1_cache import VX_gpu_pkg::*; #(
                                                             : (remote_hit_r ? 2'b01 : 2'b10); // M : S : E
                 tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
             end
+            if (state == S_FLUSH_WB && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                // mismo criterio que SNP_WB más abajo: M -> E (limpia, la
+                // línea sigue localmente, solo deja de estar dirty).
+                tag_array[flush_set_r][flush_way_r].dirty <= 1'b0;
+                tag_array[flush_set_r][flush_way_r].mesi  <= 2'b10;  // E
+            end
             // ---- lado snoop (snp_state), independiente del local (A-8) ----
             if (snp_state == SNP_IDLE && snoop_bus_if.snoop_valid && snoop_tag_hit
                 && tag_array[snoop_set][snoop_hit_way].mesi != 2'b11) begin
@@ -239,8 +245,12 @@ module l1_cache import VX_gpu_pkg::*; #(
     // bus no está garantizado estable) — si el read siguiera indexando
     // por el `req_set` vivo, data_rd_data se corrompería a mitad de un
     // miss largo. Fuera de S_IDLE, releer siempre el mismo set con el que
-    // se aceptó la petición (req_set_r, congelado).
-    wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? req_set : req_set_r;
+    // se aceptó la petición (req_set_r, congelado). S_FLUSH/S_FLUSH_WB
+    // siguen a flush_set_r -- el read síncrono queda primed un ciclo
+    // antes de necesitar data_rd_data (ver S_FLUSH más abajo).
+    wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? req_set
+                                        : (state == S_FLUSH || state == S_FLUSH_WB) ? flush_set_r
+                                        : req_set_r;
 
     // Mismo criterio, pero para el camino de snoop: fuera de SNP_IDLE
     // (es decir, durante SNP_WB/SNP_POST_WB) releer siempre snoop_set_r.
@@ -311,10 +321,65 @@ module l1_cache import VX_gpu_pkg::*; #(
     //   deadlock que A-8 pide resolver — ver docs/proposals/
     //   tfg_mesi_coherence_design.md §9 para el análisis completo y por
     //   qué se dejó fuera de esta pasada (arreglarlo bien necesita un
-    //   candado por línea al estilo MSHR, un cambio de otro tamaño).
+    //   candado por línea al estilo MSHR, un cambio de otro tamaño). La
+    //   misma carrera, en teoría, podría tocar una línea que S_FLUSH está
+    //   recorriendo en ese instante -- mismo límite conocido, no uno nuevo.
+    //
+    //   S_FLUSH/S_FLUSH_WB/S_FLUSH_DONE (Fase B): atienden un fence real
+    //   del pipeline (core_bus_if.req_data.attr[MEM_ATTR_FLUSH_OFFS] -- ver
+    //   VX_lsu_slice.sv: mem_req_attr_struct[i].is_flush = req_is_fence).
+    //   Sin esto, una línea que queda dirty tras un write-HIT (el caso
+    //   común: una sola escritura por línea, nunca más desalojada por
+    //   presión real de reemplazo) nunca llega a memoria real -- invisible
+    //   para un host que lee memoria de verdad vía DMA (no a través de la
+    //   caché). Encontrado en Fase B con un programa real (ver
+    //   docs/proposals/tfg_fase_b_integration_blocker.md §5): la mayoría de
+    //   los resultados leídos eran el patrón "poison" sin inicializar del
+    //   modelo de DRAM, no datos corruptos -- la escritura simplemente
+    //   nunca había salido de L1.
+    //     S_FLUSH      -> recorre las NUM_SETS*NUM_WAYS entradas una por
+    //                  ciclo (chequeo combinacional de valid+dirty sobre
+    //                  tag_array, sin tocar mem_bus_if todavía); si la
+    //                  entrada está limpia, avanza sola; si está dirty, va
+    //                  a S_FLUSH_WB.
+    //     S_FLUSH_WB   -> mismo mecanismo que S_WB (un ciclo después para
+    //                  que data_rd_data ya refleje flush_set_r, ver
+    //                  array_set_addr), pero indexado por
+    //                  flush_set_r/flush_way_r en vez de
+    //                  req_set_r/victim_way_r. Esta L1 habla con L2 (no con
+    //                  memoria real directo), y L2 SÍ ackea cualquier
+    //                  transacción de mem_bus_if (A-17) -- a diferencia del
+    //                  límite L2->memoria real (ver l2_cache.sv S_WB), acá
+    //                  sí hace falta esperar mem_bus_if.rsp_valid. Reenvía
+    //                  attr.is_flush en cada volcado -- no porque L2
+    //                  necesite ese bit línea por línea, sino para dejar la
+    //                  señal disponible junto con la última.
+    //     S_FLUSH_L2   -> ya vació lo propio -- ahora dispara el flush
+    //                  completo de L2 (que puede tener datos de OTRAS L1,
+    //                  volcados por snoop o por un flush de este u otro
+    //                  núcleo antes, que todavía no llegaron a memoria real
+    //                  -- ver l2_cache.sv, coordinador de flush global).
+    //                  Manda un request "sintético" (rw=0, attr.is_flush=1,
+    //                  dirección no significativa) y espera su rsp_valid
+    //                  antes de seguir -- mismo patrón que VX_dcr_flush.sv
+    //                  (código stock) usa para disparar ESTE módulo desde
+    //                  el pipeline real, solo que acá L1 lo dispara hacia
+    //                  L2. Sin esto, el flush de L1 vaciaba sus líneas
+    //                  dirty hacia L2 pero esos datos quedaban varados ahí
+    //                  -- nunca llegaban a memoria real salvo que la propia
+    //                  presión de reemplazo de L2 los desalojara por
+    //                  casualidad (encontrado en Fase B, ver
+    //                  docs/proposals/tfg_fase_b_integration_blocker.md §5).
+    //     S_FLUSH_DONE -> ya recorrió todo (local Y L2). A diferencia de
+    //                  una escritura común (fire-and-forget), un fence SÍ
+    //                  necesita una respuesta real hacia el pipeline
+    //                  (VX_lsu_slice.sv: fence_lock se mantiene hasta ver
+    //                  mem_rsp_fire && rsp_is_fence -- sin esta respuesta,
+    //                  el pipeline queda bloqueado para siempre).
     // ------------------------------------------------------------------
-    typedef enum logic [2:0] {
-        S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL, S_SNOOP_QUERY
+    typedef enum logic [3:0] {
+        S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL, S_SNOOP_QUERY,
+        S_FLUSH, S_FLUSH_WB, S_FLUSH_L2, S_FLUSH_DONE
     } state_t;
     state_t state;
 
@@ -376,6 +441,12 @@ module l1_cache import VX_gpu_pkg::*; #(
     logic [WAY_BITS-1:0]      victim_way_r;
     logic [TAG_BITS-1:0]      victim_tag_r;
 
+    // contadores del recorrido de S_FLUSH (una entrada set/vía por ciclo) +
+    // el tag de la entrada dirty que S_FLUSH_WB está volcando en este momento.
+    logic [SET_BITS-1:0]      flush_set_r;
+    logic [WAY_BITS-1:0]      flush_way_r;
+    logic [TAG_BITS-1:0]      flush_tag_r;
+
     // snoop remoto latcheado al entrar a SNP_WB (mismo criterio que los
     // registros de arriba para un miss local: todo lo que SNP_WB/
     // SNP_POST_WB necesitan se congela acá, nunca se relee snoop_bus_if
@@ -405,6 +476,14 @@ module l1_cache import VX_gpu_pkg::*; #(
     // resolverse un snoop remoto (A-8) -- solo importa el propio `state`.
     assign core_bus_if.req_ready = (state == S_IDLE);
 
+    // ---- recorrido de S_FLUSH: siguiente entrada + chequeo dirty de la actual ----
+    wire flush_last_way     = (flush_way_r == WAY_BITS'(NUM_WAYS-1));
+    wire flush_last_entry   = flush_last_way && (flush_set_r == SET_BITS'(NUM_SETS-1));
+    wire [WAY_BITS-1:0] flush_way_next = flush_last_way ? '0 : (flush_way_r + WAY_BITS'(1));
+    wire [SET_BITS-1:0] flush_set_next = flush_last_way ? (flush_set_r + SET_BITS'(1)) : flush_set_r;
+    wire flush_entry_dirty  = tag_array[flush_set_r][flush_way_r].valid
+                            && tag_array[flush_set_r][flush_way_r].dirty;
+
     // ---- FSM local ----
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -414,36 +493,48 @@ module l1_cache import VX_gpu_pkg::*; #(
             case (state)
                 S_IDLE: begin
                     if (core_bus_if.req_valid && core_bus_if.req_ready) begin
-                        req_rw_r     <= core_bus_if.req_data.rw;
-                        hit_way_r    <= hit_way;
-                        req_set_r    <= req_set;
-                        req_tag_r    <= req_tag;
-                        req_off_r    <= core_bus_if.req_data.addr[OFFSET_BITS-1:0];
-                        req_wdata_r  <= core_bus_if.req_data.data;
-                        req_byteen_r <= core_bus_if.req_data.byteen;
-                        req_ctag_r   <= core_bus_if.req_data.tag;
-                        victim_way_r <= victim_way;
-                        victim_tag_r <= tag_array[req_set][victim_way].tag;
-                        is_upgrade_r <= 1'b0;  // default; el branch de abajo lo sobreescribe si aplica
-                        if (tag_hit) begin
-                            if (core_bus_if.req_data.rw
-                                && tag_array[req_set][hit_way].mesi == 2'b01) begin
-                                // write-hit sobre S: hace falta invalidar a
-                                // los demás antes de subir a M.
-                                is_upgrade_r <= 1'b1;
-                                state        <= S_SNOOP_QUERY;
-                                `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(upgrade): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
-                            end else begin
-                                state <= S_HIT;
-                                `TRACE(2, ("%t: %s S_IDLE->S_HIT: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
-                            end
-                        end else if (tag_array[req_set][victim_way].valid
-                                  && tag_array[req_set][victim_way].dirty) begin
-                            state <= S_WB;          // hay que desalojar algo sucio primero
-                            `TRACE(2, ("%t: %s S_IDLE->S_WB: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                        req_ctag_r <= core_bus_if.req_data.tag;
+                        if (core_bus_if.req_data.attr[MEM_ATTR_FLUSH_OFFS]) begin
+                            // Fence real del pipeline -- chequear ANTES que
+                            // tag_hit/victim (la dirección de un fence no es
+                            // significativa, no hay que tratarla como un
+                            // acceso normal). Ver el comentario grande antes
+                            // de S_FLUSH/S_FLUSH_WB/S_FLUSH_DONE más abajo.
+                            flush_set_r <= '0;
+                            flush_way_r <= '0;
+                            state       <= S_FLUSH;
+                            `TRACE(2, ("%t: %s S_IDLE->S_FLUSH: fence\n", $time, INSTANCE_ID))
                         end else begin
-                            state <= S_SNOOP_QUERY;  // miss: consultar antes de llenar
-                            `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(miss): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                            req_rw_r     <= core_bus_if.req_data.rw;
+                            hit_way_r    <= hit_way;
+                            req_set_r    <= req_set;
+                            req_tag_r    <= req_tag;
+                            req_off_r    <= core_bus_if.req_data.addr[OFFSET_BITS-1:0];
+                            req_wdata_r  <= core_bus_if.req_data.data;
+                            req_byteen_r <= core_bus_if.req_data.byteen;
+                            victim_way_r <= victim_way;
+                            victim_tag_r <= tag_array[req_set][victim_way].tag;
+                            is_upgrade_r <= 1'b0;  // default; el branch de abajo lo sobreescribe si aplica
+                            if (tag_hit) begin
+                                if (core_bus_if.req_data.rw
+                                    && tag_array[req_set][hit_way].mesi == 2'b01) begin
+                                    // write-hit sobre S: hace falta invalidar a
+                                    // los demás antes de subir a M.
+                                    is_upgrade_r <= 1'b1;
+                                    state        <= S_SNOOP_QUERY;
+                                    `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(upgrade): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                                end else begin
+                                    state <= S_HIT;
+                                    `TRACE(2, ("%t: %s S_IDLE->S_HIT: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                                end
+                            end else if (tag_array[req_set][victim_way].valid
+                                      && tag_array[req_set][victim_way].dirty) begin
+                                state <= S_WB;          // hay que desalojar algo sucio primero
+                                `TRACE(2, ("%t: %s S_IDLE->S_WB: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                            end else begin
+                                state <= S_SNOOP_QUERY;  // miss: consultar antes de llenar
+                                `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(miss): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                            end
                         end
                     end
                 end
@@ -502,6 +593,69 @@ module l1_cache import VX_gpu_pkg::*; #(
                     if (req_rw_r || core_bus_if.rsp_ready) begin
                         state <= S_IDLE;
                         `TRACE(2, ("%t: %s S_FILL->S_IDLE: rsp_valid=%0d, req_rw_r=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid, req_rw_r))
+                    end
+                end
+                S_FLUSH: begin
+                    // array_set_addr ya sigue a flush_set_r en este estado
+                    // (ver más arriba) -- si esta entrada resulta dirty,
+                    // data_rd_data[flush_way_r] va a estar listo justo al
+                    // llegar a S_FLUSH_WB (un ciclo de por medio, mismo
+                    // read síncrono que S_IDLE->S_WB usa para la víctima).
+                    if (flush_entry_dirty) begin
+                        flush_tag_r <= tag_array[flush_set_r][flush_way_r].tag;
+                        state       <= S_FLUSH_WB;
+                    end else if (flush_last_entry) begin
+                        state <= S_FLUSH_L2;
+                        `TRACE(2, ("%t: %s S_FLUSH->S_FLUSH_L2: nada mas que volcar localmente\n", $time, INSTANCE_ID))
+                    end else begin
+                        flush_way_r <= flush_way_next;
+                        flush_set_r <= flush_set_next;
+                    end
+                end
+                S_FLUSH_WB: begin
+                    // Mismo mecanismo que S_WB (incluye esperar
+                    // mem_bus_if.rsp_valid de verdad -- esta L1 habla con
+                    // L2, que sí ackea, a diferencia del límite L2->memoria
+                    // real de l2_cache.sv). Ver mem_owner_r/core_wants_mem
+                    // más abajo: S_FLUSH_WB participa del mismo árbitro
+                    // entre el camino local y el de snoop.
+                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                        mem_req_sent_core_r <= 1'b1;
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        mem_req_sent_core_r <= 1'b0;
+                        `TRACE(2, ("%t: %s S_FLUSH_WB volco: addr={%0h,%0h}\n", $time, INSTANCE_ID, flush_tag_r, flush_set_r))
+                        if (flush_last_entry) begin
+                            state <= S_FLUSH_L2;
+                        end else begin
+                            flush_way_r <= flush_way_next;
+                            flush_set_r <= flush_set_next;
+                            state       <= S_FLUSH;
+                        end
+                    end
+                end
+                S_FLUSH_L2: begin
+                    // Ya vació lo propio -- dispara el flush completo de L2
+                    // (mem_req_data.rw=0, attr.is_flush=1, dirección no
+                    // significativa -- mismo mecanismo de abajo hacia
+                    // arriba que VX_dcr_flush.sv usa de arriba hacia abajo
+                    // contra este mismo módulo). Participa del mismo
+                    // mem_owner_r que S_WB/S_MISS_WAIT/S_FLUSH_WB.
+                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                        mem_req_sent_core_r <= 1'b1;
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        mem_req_sent_core_r <= 1'b0;
+                        state               <= S_FLUSH_DONE;
+                        `TRACE(2, ("%t: %s S_FLUSH_L2->S_FLUSH_DONE: L2 confirmo su propio flush\n", $time, INSTANCE_ID))
+                    end
+                end
+                S_FLUSH_DONE: begin
+                    // A diferencia de una escritura común (fire-and-forget),
+                    // un fence SÍ necesita una respuesta real -- VX_lsu_slice.sv
+                    // mantiene fence_lock hasta ver mem_rsp_fire && rsp_is_fence.
+                    // core_bus_if.rsp_valid para este estado se arma más abajo.
+                    if (core_bus_if.rsp_ready) begin
+                        state <= S_IDLE;
+                        `TRACE(2, ("%t: %s S_FLUSH_DONE->S_IDLE: fence completo\n", $time, INSTANCE_ID))
                     end
                 end
                 default: state <= S_IDLE;
@@ -593,7 +747,7 @@ module l1_cache import VX_gpu_pkg::*; #(
     typedef enum logic [1:0] { MEM_NONE, MEM_CORE, MEM_SNOOP } mem_owner_t;
     mem_owner_t mem_owner_r;
 
-    wire core_wants_mem  = (state == S_WB) || (state == S_MISS_WAIT);
+    wire core_wants_mem  = (state == S_WB) || (state == S_MISS_WAIT) || (state == S_FLUSH_WB) || (state == S_FLUSH_L2);
     wire snoop_wants_mem = (snp_state == SNP_WB);
 
     always_ff @(posedge clk) begin
@@ -630,14 +784,22 @@ module l1_cache import VX_gpu_pkg::*; #(
     // ({snoop_tag_r,snoop_set_r}), siempre un write (flush).
     assign mem_bus_if.req_valid       = (mem_owner_r == MEM_CORE  && core_wants_mem  && !mem_req_sent_core_r)
                                       || (mem_owner_r == MEM_SNOOP && snoop_wants_mem && !mem_req_sent_snoop_r);
-    assign mem_bus_if.req_data.rw     = (mem_owner_r == MEM_SNOOP) ? 1'b1 : (state == S_WB);
+    // S_FLUSH_L2: rw=0 (una "lectura", mismo criterio que VX_dcr_flush.sv
+    // real usa para disparar ESTE módulo desde el pipeline) -- dirección y
+    // datos no significativos, solo importa attr.is_flush más abajo.
+    assign mem_bus_if.req_data.rw     = (mem_owner_r == MEM_SNOOP) ? 1'b1 : (state == S_WB || state == S_FLUSH_WB);
     assign mem_bus_if.req_data.addr   = (mem_owner_r == MEM_SNOOP) ? {snoop_tag_r, snoop_set_r}
                                        : (state == S_WB)            ? {victim_tag_r, req_set_r}
+                                       : (state == S_FLUSH_WB)      ? {flush_tag_r, flush_set_r}
                                        : {req_tag_r, req_set_r};
     assign mem_bus_if.req_data.data   = (mem_owner_r == MEM_SNOOP) ? snoop_rd_data[snoop_way_r]
-                                                                    : data_rd_data[victim_way_r];  // solo se usa en WB
+                                       : (state == S_FLUSH_WB)      ? data_rd_data[flush_way_r]
+                                                                     : data_rd_data[victim_way_r];  // solo se usa en WB
     assign mem_bus_if.req_data.byteen = '1;
-    assign mem_bus_if.req_data.attr   = '0;
+    // S_FLUSH_L2 dispara el flush completo de L2 -- mismo bit que el
+    // propio fence real del pipeline usa para disparar a ESTE módulo
+    // (MEM_ATTR_FLUSH_OFFS, VX_dcr_flush.sv). Ningún otro estado lo usa.
+    assign mem_bus_if.req_data.attr   = (state == S_FLUSH_L2) ? MEM_ATTR_WIDTH'(1 << MEM_ATTR_FLUSH_OFFS) : '0;
     // TODO: con más de un miss en vuelo hace falta un tag real acá para
     // no confundir respuestas — con una sola petición a la vez por dueño
     // alcanza con 0.
@@ -693,9 +855,15 @@ module l1_cache import VX_gpu_pkg::*; #(
     wire [WORD_SIZE*8-1:0] hit_rsp_word  = hit_line_old[req_off_r*WORD_SIZE*8 +: WORD_SIZE*8];
     wire [WORD_SIZE*8-1:0] fill_rsp_word = fetched_line_r[req_off_r*WORD_SIZE*8 +: WORD_SIZE*8];
 
-    assign core_bus_if.rsp_valid    = ((state == S_HIT) || (state == S_FILL)) && !req_rw_r;
+    // S_FLUSH_DONE siempre responde (un fence no es ni lectura ni
+    // escritura -- VX_lsu_slice.sv necesita esta respuesta para soltar
+    // fence_lock, ver el comentario grande antes de S_FLUSH más arriba).
+    assign core_bus_if.rsp_valid    = (((state == S_HIT) || (state == S_FILL)) && !req_rw_r)
+                                    || (state == S_FLUSH_DONE);
     assign core_bus_if.rsp_data.tag = req_ctag_r;
-    assign core_bus_if.rsp_data.data = (state == S_HIT) ? hit_rsp_word : fill_rsp_word;
+    assign core_bus_if.rsp_data.data = (state == S_HIT)        ? hit_rsp_word
+                                      : (state == S_FLUSH_DONE) ? '0
+                                                                 : fill_rsp_word;
 
 
     // ------------------------------------------------------------------

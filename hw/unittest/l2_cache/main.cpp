@@ -73,21 +73,43 @@ static void service_mem_port(MemPortState &st, uint8_t req_valid, uint32_t req_a
         st.cap_tag   = req_tag;
         st.phase     = DELAY;
         if (req_count) ++(*req_count);
+        // Memoria real (sim/rtlsim/processor.cpp) escribe *ram_ en el
+        // mismo ciclo que acepta el request (req_valid && req_ready),
+        // no cuando arma la respuesta -- confirmado leyendo ese archivo
+        // en Fase B. Si este mock escribiera recién en DELAY (como antes),
+        // un bank de l2_cache.sv que avanza al aceptarse el write (sin
+        // esperar rsp_valid, fix de Fase B: la memoria real nunca ackea
+        // una escritura) podría leer ESTA MISMA dirección de vuelta antes
+        // de que el mock la hubiera comprometido -- encontrado como
+        // regresión real al agregar soporte de fence en l1_cache.sv.
+        if (req_rw) mem[req_addr] = req_data;
       }
       break;
     case DELAY: {
       req_ready = 0;
-      if (st.cap_rw) mem[st.cap_addr] = st.cap_wdata;
-      auto it   = mem.find(st.cap_addr);
-      rsp_valid = 1;
-      rsp_data  = (it != mem.end()) ? it->second : 0;
-      // El árbitro global (VX_mem_bus_arb, A-14) ensancha el tag de
-      // salida para poder enrutar la respuesta al banco correcto --
-      // el mock de memoria tiene que ecoar EXACTAMENTE el tag que
-      // recibió, nunca hardcodear 0 (eso solo valía con un pedido en
-      // vuelo a la vez, antes de A-14).
-      rsp_tag   = st.cap_tag;
-      st.phase  = RESPONDING;
+      if (st.cap_rw) {
+        // Memoria real (sim/rtlsim/processor.cpp) NUNCA levanta
+        // mem_rsp_valid para una escritura -- fire-and-forget de
+        // verdad, no una demora (confirmado en Fase B). Si este mock
+        // igual ackeara la escritura (como antes), un bank de
+        // l2_cache.sv que ya avanzó sin esperar ese ack (mismo fix de
+        // Fase B) podía confundir ese ack sobrante con la respuesta de
+        // la SIGUIENTE transacción que emite apenas avanza -- carrera
+        // real, encontrada como regresión al agregar soporte de fence
+        // en l1_cache.sv.
+        st.phase = WAIT_REQ;
+      } else {
+        auto it   = mem.find(st.cap_addr);
+        rsp_valid = 1;
+        rsp_data  = (it != mem.end()) ? it->second : 0;
+        // El árbitro global (VX_mem_bus_arb, A-14) ensancha el tag de
+        // salida para poder enrutar la respuesta al banco correcto --
+        // el mock de memoria tiene que ecoar EXACTAMENTE el tag que
+        // recibió, nunca hardcodear 0 (eso solo valía con un pedido en
+        // vuelo a la vez, antes de A-14).
+        rsp_tag   = st.cap_tag;
+        st.phase  = RESPONDING;
+      }
       break;
     }
     case RESPONDING:

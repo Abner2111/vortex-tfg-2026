@@ -96,6 +96,7 @@ module l2_cache import VX_gpu_pkg::*; #(
     logic [NUM_CORES-1:0][ADDR_WIDTH-1:0]     core_req_addr_flat;
     logic [NUM_CORES-1:0][LINE_BITS-1:0]      core_req_data_flat;
     logic [NUM_CORES-1:0][CORE_TAG_WIDTH-1:0] core_req_tag_flat;
+    logic [NUM_CORES-1:0]                     core_req_isflush_flat;
     logic [NUM_CORES-1:0]                     core_rsp_ready_flat;
 
     logic [NUM_CORES-1:0]                     core_req_ready_flat;
@@ -104,12 +105,19 @@ module l2_cache import VX_gpu_pkg::*; #(
     logic [NUM_CORES-1:0][CORE_TAG_WIDTH-1:0] core_rsp_tag_flat;
 
     for (genvar c = 0; c < NUM_CORES; ++c) begin : g_core_flatten
-        assign core_req_valid_flat[c] = core_bus_if[c].req_valid;
-        assign core_req_rw_flat[c]    = core_bus_if[c].req_data.rw;
-        assign core_req_addr_flat[c]  = core_bus_if[c].req_data.addr;
-        assign core_req_data_flat[c]  = core_bus_if[c].req_data.data;
-        assign core_req_tag_flat[c]   = core_bus_if[c].req_data.tag;
-        assign core_rsp_ready_flat[c] = core_bus_if[c].rsp_ready;
+        assign core_req_valid_flat[c]    = core_bus_if[c].req_valid;
+        assign core_req_rw_flat[c]       = core_bus_if[c].req_data.rw;
+        assign core_req_addr_flat[c]     = core_bus_if[c].req_data.addr;
+        assign core_req_data_flat[c]     = core_bus_if[c].req_data.data;
+        assign core_req_tag_flat[c]      = core_bus_if[c].req_data.tag;
+        // Fase B: l1_cache.sv reenvía su propio fence (S_FLUSH_L2) como un
+        // request con este bit prendido -- ver el mismo MEM_ATTR_FLUSH_OFFS
+        // que usa el fence real de Vortex (VX_dcr_flush.sv, confirmado
+        // leyendo código stock). No es un acceso a una dirección real: se
+        // chequea ANTES que el direccionamiento banco-intercalado de más
+        // abajo (ver bank_req_mask) y el árbitro global de flush más abajo.
+        assign core_req_isflush_flat[c]  = core_bus_if[c].req_data.attr[MEM_ATTR_FLUSH_OFFS];
+        assign core_rsp_ready_flat[c]    = core_bus_if[c].rsp_ready;
 
         assign core_bus_if[c].req_ready     = core_req_ready_flat[c];
         assign core_bus_if[c].rsp_valid     = core_rsp_valid_flat[c];
@@ -138,6 +146,42 @@ module l2_cache import VX_gpu_pkg::*; #(
     logic [NUM_BANKS-1:0][CORE_TAG_WIDTH-1:0] bank_resp_ctag;
 
     // ------------------------------------------------------------------
+    // Coordinador de flush global (Fase B): un fence que llega de CUALQUIER
+    // núcleo dispara un recorrido completo de TODOS los bancos (no solo el
+    // banco al que "apuntaría" su dirección -- un fence no tiene dirección
+    // real, hay que vaciar TODA la L2). GF_IDLE acepta el primer pedido de
+    // flush que vea (prioridad fija, índice más bajo primero, mismo
+    // criterio que snoop_bus.sv); GF_FLUSHING mantiene global_flush_req en
+    // alto hasta que los NUM_BANKS bancos reporten bank_flush_done; GF_DONE
+    // responde al núcleo que lo pidió. Sin esto, l1_cache.sv podía volcar
+    // sus líneas dirty hacia L2 (su propio fence) pero esos datos se
+    // quedaban varados en L2 -- nunca llegaban a memoria real salvo que la
+    // propia presión de reemplazo de L2 los desalojara por casualidad (ver
+    // docs/proposals/tfg_fase_b_integration_blocker.md §5).
+    // ------------------------------------------------------------------
+    typedef enum logic [1:0] { GF_IDLE, GF_FLUSHING, GF_DONE } gflush_state_t;
+    gflush_state_t gflush_state;
+    logic [CORE_BITS-1:0]      gflush_core_r;
+    logic [CORE_TAG_WIDTH-1:0] gflush_ctag_r;
+    logic [NUM_BANKS-1:0]      bank_flush_done;
+
+    wire global_flush_req      = (gflush_state == GF_FLUSHING);
+    wire all_banks_flush_done  = &bank_flush_done;
+
+    logic                 gflush_grant_valid;
+    logic [CORE_BITS-1:0] gflush_grant_idx;
+    always_comb begin
+        gflush_grant_valid = 1'b0;
+        gflush_grant_idx   = '0;
+        for (int c = NUM_CORES - 1; c >= 0; c--) begin
+            if (core_req_valid_flat[c] && core_req_isflush_flat[c]) begin
+                gflush_grant_valid = 1'b1;
+                gflush_grant_idx   = CORE_BITS'(c);
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
     // Bancos BRAM independientes (paso 1): cada banco, su propio tag array
     // y, por vía, su propia memoria síncrona de datos -- mismo patrón que
     // l1_cache.sv (hw/rtl/tfg_l1/l1_cache.sv: "NUM_WAYS memorias síncronas
@@ -158,14 +202,17 @@ module l2_cache import VX_gpu_pkg::*; #(
         // `state == S_IDLE` -- recién acá aparece la FSM que puede estar
         // "ocupada".
         // --------------------------------------------------------------
-        typedef enum logic [2:0] { S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL } state_t;
+        typedef enum logic [2:0] { S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL, S_FLUSH, S_FLUSH_WB } state_t;
         state_t state;
 
         // Paso 4: ya no se acota a solo writes -- un read-miss de L1
-        // también tiene que poder arbitrar para entrar.
+        // también tiene que poder arbitrar para entrar. Un fence (Fase B)
+        // no tiene dirección real -- lo atiende el coordinador global de
+        // flush más abajo, nunca este arbitraje per-banco.
         wire [NUM_CORES-1:0] bank_req_mask;
         for (genvar c = 0; c < NUM_CORES; ++c) begin : g_mask
             assign bank_req_mask[c] = core_req_valid_flat[c]
+                                    && !core_req_isflush_flat[c]
                                     && (core_bank_flat[c] == BANK_BITS'(b))
                                     && (state == S_IDLE);
         end
@@ -235,6 +282,23 @@ module l2_cache import VX_gpu_pkg::*; #(
         logic [LINE_BITS-1:0]      fetched_line_r;
         logic                      mem_req_sent_r;  // paso 5: ya mandamos el req a mem_bus_if[b], esperando rsp
 
+        // recorrido de S_FLUSH de ESTE banco (Fase B) + el tag de la
+        // entrada dirty que S_FLUSH_WB está volcando -- mismo patrón que
+        // l1_cache.sv.
+        logic [SET_BITS-1:0] flush_set_r;
+        logic [WAY_BITS-1:0] flush_way_r;
+        logic [TAG_BITS-1:0] flush_tag_r;
+        logic                flush_done_r;
+
+        wire flush_last_way    = (flush_way_r == WAY_BITS'(NUM_WAYS-1));
+        wire flush_last_entry  = flush_last_way && (flush_set_r == SET_BITS'(NUM_SETS-1));
+        wire [WAY_BITS-1:0] flush_way_next = flush_last_way ? '0 : (flush_way_r + WAY_BITS'(1));
+        wire [SET_BITS-1:0] flush_set_next = flush_last_way ? (flush_set_r + SET_BITS'(1)) : flush_set_r;
+        wire flush_entry_dirty = tag_array[flush_set_r][flush_way_r].valid
+                               && tag_array[flush_set_r][flush_way_r].dirty;
+
+        assign bank_flush_done[b] = flush_done_r;
+
         // núcleo que ganó este banco y está esperando la respuesta (S_HIT
         // de lectura / S_FILL) -- las escrituras son fire-and-forget y no
         // lo necesitan, pero no cuesta nada latchearlo siempre.
@@ -252,7 +316,16 @@ module l2_cache import VX_gpu_pkg::*; #(
             if (reset) begin
                 state          <= S_IDLE;
                 mem_req_sent_r <= 1'b0;
+                flush_done_r   <= 1'b0;
             end else begin
+                // El coordinador global baja global_flush_req recién
+                // cuando TODOS los bancos reportaron flush_done_r -- ver
+                // más arriba. Rearma este banco para la PRÓXIMA ronda
+                // apenas eso pasa (si no, bank_flush_done[b] seguiría en
+                // 1 por un fence viejo y el próximo arrancaría "ya listo").
+                if (!global_flush_req) begin
+                    flush_done_r <= 1'b0;
+                end
                 case (state)
                     S_IDLE: begin
                         if (arb_valid) begin
@@ -279,6 +352,16 @@ module l2_cache import VX_gpu_pkg::*; #(
                                 state <= S_MISS_WAIT;  // read-miss: pedirla al árbitro global
                             end
                             `TRACE(2, ("%t: %s-bank%0d S_IDLE->grant: core=%0d, addr={%0h,%0h,%0d}, rw=%0d, tag_hit=%0d\n", $time, INSTANCE_ID, b, arb_index, sel_tag, sel_set, b, core_req_rw_flat[arb_index], tag_hit))
+                        end else if (global_flush_req && !flush_done_r) begin
+                            // Fence (Fase B): ningún núcleo ganó el arbitraje
+                            // normal este ciclo -- si el coordinador global
+                            // está pidiendo un flush y este banco todavía no
+                            // lo hizo en esta ronda, arranca su propio
+                            // recorrido completo.
+                            flush_set_r <= '0;
+                            flush_way_r <= '0;
+                            state       <= S_FLUSH;
+                            `TRACE(2, ("%t: %s-bank%0d S_IDLE->S_FLUSH: fence\n", $time, INSTANCE_ID, b))
                         end
                     end
                     S_HIT: begin
@@ -339,6 +422,40 @@ module l2_cache import VX_gpu_pkg::*; #(
                         if (resp_ready_sel)
                             state <= S_IDLE;
                     end
+                    S_FLUSH: begin
+                        // array_set_addr sigue a flush_set_r en este estado
+                        // (ver más abajo) -- si la entrada es dirty, para
+                        // cuando lleguemos a S_FLUSH_WB data_rd_data[flush_way_r]
+                        // ya está listo (mismo read síncrono con 1 ciclo de
+                        // latencia que usa S_IDLE->S_WB para la víctima).
+                        if (flush_entry_dirty) begin
+                            flush_tag_r <= tag_array[flush_set_r][flush_way_r].tag;
+                            state       <= S_FLUSH_WB;
+                        end else if (flush_last_entry) begin
+                            flush_done_r <= 1'b1;
+                            state        <= S_IDLE;
+                            `TRACE(2, ("%t: %s-bank%0d S_FLUSH done: nada mas que volcar\n", $time, INSTANCE_ID, b))
+                        end else begin
+                            flush_way_r <= flush_way_next;
+                            flush_set_r <= flush_set_next;
+                        end
+                    end
+                    S_FLUSH_WB: begin
+                        // Mismo criterio que S_WB: esta L2 habla con memoria
+                        // real por mem_bus_if[b] -- nunca espera un ack para
+                        // una escritura (fix de Fase B, ver S_WB más arriba).
+                        if (mem_req_fire) begin
+                            `TRACE(2, ("%t: %s-bank%0d S_FLUSH_WB volco: addr={%0h,%0h,%0d}\n", $time, INSTANCE_ID, b, flush_tag_r, flush_set_r, b))
+                            if (flush_last_entry) begin
+                                flush_done_r <= 1'b1;
+                                state        <= S_IDLE;
+                            end else begin
+                                flush_way_r <= flush_way_next;
+                                flush_set_r <= flush_set_next;
+                                state       <= S_FLUSH;
+                            end
+                        end
+                    end
                     default: state <= S_IDLE;
                 endcase
             end
@@ -357,11 +474,13 @@ module l2_cache import VX_gpu_pkg::*; #(
                         // write-hit: el dato ya se escribe vía fsm_data_wr_* más
                         // abajo -- acá solo hace falta ensuciar la línea.
                         tag_array[req_set_r][hit_way_r].dirty <= 1'b1;
+                        `TRACE(2, ("%t: %s-bank%0d tag_array write-hit: set=%0h way=%0h\n", $time, INSTANCE_ID, b, req_set_r, hit_way_r))
                     end else begin
                         // write-miss directo: asienta la línea nueva completa.
                         tag_array[req_set_r][victim_way_r].valid <= 1'b1;
                         tag_array[req_set_r][victim_way_r].dirty <= 1'b1;
                         tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
+                        `TRACE(2, ("%t: %s-bank%0d tag_array write-miss-direct: set=%0h way=%0h tag=%0h\n", $time, INSTANCE_ID, b, req_set_r, victim_way_r, req_tag_r))
                     end
                 end
                 if (state == S_MISS_WAIT && mem_rsp_fire) begin
@@ -369,6 +488,7 @@ module l2_cache import VX_gpu_pkg::*; #(
                     tag_array[req_set_r][victim_way_r].valid <= 1'b1;
                     tag_array[req_set_r][victim_way_r].dirty <= 1'b0;
                     tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
+                    `TRACE(2, ("%t: %s-bank%0d tag_array fill: set=%0h way=%0h tag=%0h\n", $time, INSTANCE_ID, b, req_set_r, victim_way_r, req_tag_r))
                 end
             end
         end
@@ -403,7 +523,10 @@ module l2_cache import VX_gpu_pkg::*; #(
         // Fuera de S_IDLE, releer siempre el set con el que se aceptó la
         // petición (req_set_r, congelado) -- mismo motivo que l1_cache.sv:
         // sel_set/arb_index ya no valen una vez que el banco está ocupado.
-        wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? sel_set : req_set_r;
+        // S_FLUSH/S_FLUSH_WB siguen a flush_set_r en cambio.
+        wire [SET_BITS-1:0] array_set_addr = (state == S_IDLE) ? sel_set
+                                            : (state == S_FLUSH || state == S_FLUSH_WB) ? flush_set_r
+                                                                                         : req_set_r;
         logic [LINE_BITS-1:0] data_rd_data [NUM_WAYS];
 
         for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
@@ -432,12 +555,13 @@ module l2_cache import VX_gpu_pkg::*; #(
         // reconstruir la dirección GLOBAL de línea -- tag/set por sí solos
         // colisionarían con la misma línea servida por OTRO banco. En
         // S_WB es la dirección VIEJA (la víctima); en S_MISS_WAIT, la NUEVA.
-        assign mem_bus_if[b].req_valid      = ((state == S_WB) || (state == S_MISS_WAIT)) && !mem_req_sent_r;
-        assign mem_bus_if[b].req_data.rw    = (state == S_WB);
-        assign mem_bus_if[b].req_data.addr  = (state == S_WB)
-                                             ? {victim_tag_r, req_set_r, BANK_BITS'(b)}
-                                             : {req_tag_r,    req_set_r, BANK_BITS'(b)};
-        assign mem_bus_if[b].req_data.data  = data_rd_data[victim_way_r];  // solo se usa en S_WB
+        assign mem_bus_if[b].req_valid      = ((state == S_WB) || (state == S_MISS_WAIT) || (state == S_FLUSH_WB)) && !mem_req_sent_r;
+        assign mem_bus_if[b].req_data.rw    = (state == S_WB) || (state == S_FLUSH_WB);
+        assign mem_bus_if[b].req_data.addr  = (state == S_WB)       ? {victim_tag_r, req_set_r,   BANK_BITS'(b)}
+                                             : (state == S_FLUSH_WB) ? {flush_tag_r,  flush_set_r, BANK_BITS'(b)}
+                                                                      : {req_tag_r,    req_set_r,   BANK_BITS'(b)};
+        assign mem_bus_if[b].req_data.data  = (state == S_FLUSH_WB) ? data_rd_data[flush_way_r]
+                                                                     : data_rd_data[victim_way_r];  // solo se usa en WB/S_FLUSH_WB
         assign mem_bus_if[b].req_data.byteen = '1;
         assign mem_bus_if[b].req_data.attr   = '0;
         // TODO (igual que l1_cache.sv): con más de un miss en vuelo por
@@ -458,6 +582,41 @@ module l2_cache import VX_gpu_pkg::*; #(
             end
         end
 
+    end
+
+    // ------------------------------------------------------------------
+    // Coordinador de flush global: secuencial (ver declaraciones/el
+    // árbitro de prioridad combinacional junto a bank_flush_done, antes
+    // del generate de bancos).
+    // ------------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            gflush_state <= GF_IDLE;
+        end else begin
+            case (gflush_state)
+                GF_IDLE: begin
+                    if (gflush_grant_valid) begin
+                        gflush_core_r <= gflush_grant_idx;
+                        gflush_ctag_r <= core_req_tag_flat[gflush_grant_idx];
+                        gflush_state  <= GF_FLUSHING;
+                        `TRACE(2, ("%t: %s global-flush GF_IDLE->GF_FLUSHING: core=%0d\n", $time, INSTANCE_ID, gflush_grant_idx))
+                    end
+                end
+                GF_FLUSHING: begin
+                    if (all_banks_flush_done) begin
+                        gflush_state <= GF_DONE;
+                        `TRACE(2, ("%t: %s global-flush GF_FLUSHING->GF_DONE\n", $time, INSTANCE_ID))
+                    end
+                end
+                GF_DONE: begin
+                    if (core_rsp_ready_flat[gflush_core_r]) begin
+                        gflush_state <= GF_IDLE;
+                        `TRACE(2, ("%t: %s global-flush GF_DONE->GF_IDLE: core=%0d\n", $time, INSTANCE_ID, gflush_core_r))
+                    end
+                end
+                default: gflush_state <= GF_IDLE;
+            endcase
+        end
     end
 
     // ------------------------------------------------------------------
@@ -486,6 +645,17 @@ module l2_cache import VX_gpu_pkg::*; #(
                     rsp_d = bank_resp_data[b];
                     rsp_t = bank_resp_ctag[b];
                 end
+            end
+            // Coordinador de flush global: acepta/responde directo, sin
+            // pasar por ningún banco en particular (un fence no tiene
+            // dirección real).
+            if ((gflush_state == GF_IDLE) && gflush_grant_valid && (gflush_grant_idx == CORE_BITS'(c))) begin
+                req_r = 1'b1;
+            end
+            if ((gflush_state == GF_DONE) && (gflush_core_r == CORE_BITS'(c))) begin
+                rsp_v = 1'b1;
+                rsp_d = '0;
+                rsp_t = gflush_ctag_r;
             end
         end
         assign core_req_ready_flat[c] = req_r;
