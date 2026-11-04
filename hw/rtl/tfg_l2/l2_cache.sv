@@ -278,6 +278,7 @@ module l2_cache import VX_gpu_pkg::*; #(
                             end else begin
                                 state <= S_MISS_WAIT;  // read-miss: pedirla al árbitro global
                             end
+                            `TRACE(2, ("%t: %s-bank%0d S_IDLE->grant: core=%0d, addr={%0h,%0h,%0d}, rw=%0d, tag_hit=%0d\n", $time, INSTANCE_ID, b, arb_index, sel_tag, sel_set, b, core_req_rw_flat[arb_index], tag_hit))
                         end
                     end
                     S_HIT: begin
@@ -309,11 +310,15 @@ module l2_cache import VX_gpu_pkg::*; #(
                         end
                     end
                     S_MISS_WAIT: begin
-                        if (mem_req_fire) mem_req_sent_r <= 1'b1;
+                        if (mem_req_fire) begin
+                            mem_req_sent_r <= 1'b1;
+                            `TRACE(2, ("%t: %s-bank%0d S_MISS_WAIT req sent: addr={%0h,%0h,%0d}\n", $time, INSTANCE_ID, b, req_tag_r, req_set_r, b))
+                        end
                         if (mem_rsp_fire) begin
                             mem_req_sent_r <= 1'b0;
                             fetched_line_r <= mem_bus_if[b].rsp_data.data;
                             state          <= S_FILL;
+                            `TRACE(2, ("%t: %s-bank%0d S_MISS_WAIT->S_FILL: addr={%0h,%0h,%0d}\n", $time, INSTANCE_ID, b, req_tag_r, req_set_r, b))
                         end
                     end
                     S_FILL: begin

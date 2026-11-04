@@ -253,6 +253,41 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     // Generate all clusters
     for (genvar cluster_id = 0; cluster_id < `VX_CFG_NUM_CLUSTERS; ++cluster_id) begin : g_clusters
 
+`ifdef TFG_USE_CUSTOM_CLUSTER
+        // tfg_cluster.sv (TFG) reemplaza VX_cluster.sv -- solo soporta la
+        // config mínima objetivo del TFG (ver su propio comentario de
+        // cabecera): sin SCOPE_IO, perf, raster ni VM. Nada de esto se
+        // chequea en VX_cluster.sv porque ahí esos puertos son opcionales
+        // de verdad; acá hace falta el assert porque tfg_cluster.sv ni
+        // siquiera declara esos puertos.
+        `STATIC_ASSERT (`VX_CFG_NUM_CLUSTERS == 1,
+            ("TFG_USE_CUSTOM_CLUSTER: tfg_cluster.sv solo soporta VX_CFG_NUM_CLUSTERS==1"))
+    `ifdef PERF_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_CUSTOM_CLUSTER: tfg_cluster.sv no soporta PERF_ENABLE"))
+    `endif
+    `ifdef VX_CFG_EXT_RASTER_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_CUSTOM_CLUSTER: tfg_cluster.sv no soporta VX_CFG_EXT_RASTER_ENABLE"))
+    `endif
+    `ifdef VX_CFG_VM_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_CUSTOM_CLUSTER: tfg_cluster.sv no soporta VX_CFG_VM_ENABLE"))
+    `endif
+
+        tfg_cluster #(
+            .CLUSTER_ID  (cluster_id),
+            .INSTANCE_ID (`SFORMATF(("cluster%0d", cluster_id)))
+        ) cluster (
+            .clk        (clk),
+            .reset      (reset),
+
+            .dcr_bus_if (per_cluster_dcr_bus_if[cluster_id]),
+
+            .mem_bus_if (per_cluster_mem_bus_if[cluster_id * L2_MEM_PORTS +: L2_MEM_PORTS]),
+
+            .kmu_bus_if (per_cluster_kmu_bus_if[cluster_id +: 1]),
+
+            .busy       (per_cluster_busy[cluster_id])
+        );
+`else
         VX_cluster #(
             .CLUSTER_ID (cluster_id),
             .INSTANCE_ID (`SFORMATF(("cluster%0d", cluster_id)))
@@ -288,6 +323,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
 
             .busy               (per_cluster_busy[cluster_id])
         );
+`endif
     end
     // Launch liveness: a beat resident in a per-cluster output skid is folded into
     // busy combinationally. The device input

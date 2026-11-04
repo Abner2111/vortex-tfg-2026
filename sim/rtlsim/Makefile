@@ -57,6 +57,13 @@ ifneq (,$(filter -DVX_CFG_FPU_TYPE_FPNEW -DVX_CFG_TCU_TYPE_FPNEW, $(XCONFIGS)))
 endif
 RTL_INCLUDE = -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SRC_DIR) -I$(RTL_DIR) -I$(DPI_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INCLUDE)
 
+# TFG: tfg_cluster.sv (Vortex.sv, behind `ifdef TFG_USE_CUSTOM_CLUSTER) pulls
+# in l1_cache.sv/l2_cache.sv/snoop_bus.sv -- not part of the default RTL_INCLUDE
+# search path, so Verilator can't auto-discover them unless this flag is set.
+ifneq (,$(filter -DTFG_USE_CUSTOM_CLUSTER, $(CONFIGS)))
+	RTL_INCLUDE += -I$(RTL_DIR)/tfg_l1 -I$(RTL_DIR)/tfg_l2
+endif
+
 # Add TCU extension sources
 ifneq (,$(filter -DVX_CFG_EXT_TCU_ENABLE, $(XCONFIGS)))
 	RTL_PKGS += $(RTL_DIR)/tcu/VX_tcu_pkg.sv

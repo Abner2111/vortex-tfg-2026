@@ -432,20 +432,26 @@ module l1_cache import VX_gpu_pkg::*; #(
                                 // los demás antes de subir a M.
                                 is_upgrade_r <= 1'b1;
                                 state        <= S_SNOOP_QUERY;
+                                `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(upgrade): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                             end else begin
                                 state <= S_HIT;
+                                `TRACE(2, ("%t: %s S_IDLE->S_HIT: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                             end
                         end else if (tag_array[req_set][victim_way].valid
                                   && tag_array[req_set][victim_way].dirty) begin
                             state <= S_WB;          // hay que desalojar algo sucio primero
+                            `TRACE(2, ("%t: %s S_IDLE->S_WB: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                         end else begin
                             state <= S_SNOOP_QUERY;  // miss: consultar antes de llenar
+                            `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(miss): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                         end
                     end
                 end
                 S_HIT: begin
-                    if (core_bus_if.rsp_ready)
+                    if (core_bus_if.rsp_ready) begin
                         state <= S_IDLE;
+                        `TRACE(2, ("%t: %s S_HIT->S_IDLE: rsp_valid=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid))
+                    end
                 end
                 S_WB: begin
                     if (mem_bus_if.req_valid && mem_bus_if.req_ready)
@@ -453,6 +459,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                     if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
                         mem_req_sent_core_r <= 1'b0;
                         state               <= S_SNOOP_QUERY;  // ahora sí, consultar antes de llenar
+                        `TRACE(2, ("%t: %s S_WB->S_SNOOP_QUERY: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
                     end
                 end
                 S_SNOOP_QUERY: begin
@@ -463,6 +470,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                     if (snoop_mst_if.snoop_valid && snoop_mst_if.snoop_ready) begin
                         remote_hit_r <= snoop_mst_if.snoop_hit;
                         state        <= is_upgrade_r ? S_HIT : S_MISS_WAIT;
+                        `TRACE(2, ("%t: %s S_SNOOP_QUERY->%s: addr={%0h,%0h}, remote_hit=%0d\n", $time, INSTANCE_ID, is_upgrade_r ? "S_HIT" : "S_MISS_WAIT", req_tag_r, req_set_r, snoop_mst_if.snoop_hit))
                     end
                 end
                 S_MISS_WAIT: begin
@@ -472,11 +480,14 @@ module l1_cache import VX_gpu_pkg::*; #(
                         mem_req_sent_core_r <= 1'b0;
                         fetched_line_r      <= mem_bus_if.rsp_data.data;
                         state               <= S_FILL;
+                        `TRACE(2, ("%t: %s S_MISS_WAIT->S_FILL: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
                     end
                 end
                 S_FILL: begin
-                    if (core_bus_if.rsp_ready)
+                    if (core_bus_if.rsp_ready) begin
                         state <= S_IDLE;
+                        `TRACE(2, ("%t: %s S_FILL->S_IDLE: rsp_valid=%0d, req_rw_r=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid, req_rw_r))
+                    end
                 end
                 default: state <= S_IDLE;
             endcase
