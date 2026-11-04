@@ -96,6 +96,7 @@ module snoop_bus #(
                         pending_r <= ~(NUM_L1'(1) << grant_idx);
                         hit_acc_r <= 1'b0;
                         bus_state <= BUS_BROADCAST;
+                        `TRACE(2, ("%t: snoop_bus BUS_IDLE->BUS_BROADCAST: grant=%0d, addr=%0h, rw=%0d, pending=%0b\n", $time, grant_idx, req_addr_flat[grant_idx], req_rw_flat[grant_idx], ~(NUM_L1'(1) << grant_idx)))
                     end
                 end
                 BUS_BROADCAST: begin
@@ -103,10 +104,13 @@ module snoop_bus #(
                         if (pending_r[j] && rsp_ready_flat[j]) begin
                             hit_acc_r    <= hit_acc_r | rsp_hit_flat[j];
                             pending_r[j] <= 1'b0;
+                            `TRACE(2, ("%t: snoop_bus pending[%0d] resolved: hit=%0d\n", $time, j, rsp_hit_flat[j]))
                         end
                     end
-                    if (pending_r == '0)
+                    if (pending_r == '0) begin
                         bus_state <= BUS_DONE;
+                        `TRACE(2, ("%t: snoop_bus BUS_BROADCAST->BUS_DONE: grant=%0d, hit_acc=%0d\n", $time, grant_r, hit_acc_r))
+                    end
                 end
                 BUS_DONE: begin
                     bus_state <= BUS_IDLE;

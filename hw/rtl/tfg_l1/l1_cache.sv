@@ -158,7 +158,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                 tag_array[req_set_r][hit_way_r].dirty <= 1'b1;
                 tag_array[req_set_r][hit_way_r].mesi  <= 2'b11;
             end
-            if (state == S_MISS_WAIT && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+            if (state == S_MISS_WAIT && core_rsp_fire) begin
                 // fill: la línea que llega de mem_bus_if reemplaza a la víctima.
                 // Si estaba dirty, S_WB ya la volcó a mem_bus_if antes de
                 // llegar acá (ver arriba) — para este punto es seguro pisarla.
@@ -172,7 +172,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                                                             : (remote_hit_r ? 2'b01 : 2'b10); // M : S : E
                 tag_array[req_set_r][victim_way_r].tag   <= req_tag_r;
             end
-            if (state == S_FLUSH_WB && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+            if (state == S_FLUSH_WB && core_rsp_fire) begin
                 // mismo criterio que SNP_WB más abajo: M -> E (limpia, la
                 // línea sigue localmente, solo deja de estar dirty).
                 tag_array[flush_set_r][flush_way_r].dirty <= 1'b0;
@@ -188,7 +188,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                 else
                     tag_array[snoop_set][snoop_hit_way].mesi  <= 2'b01;      // E->S (S sigue S)
             end
-            if (snp_state == SNP_WB && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+            if (snp_state == SNP_WB && snoop_rsp_fire) begin
                 // flush completo: M -> E (limpia, todavía exclusiva un instante)
                 tag_array[snoop_set_r][snoop_way_r].dirty <= 1'b0;
                 tag_array[snoop_set_r][snoop_way_r].mesi  <= 2'b10;  // E
@@ -259,11 +259,32 @@ module l1_cache import VX_gpu_pkg::*; #(
     for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
         logic [LINE_BITS-1:0] mem [NUM_SETS];
 
+        // Bypass de snoop_rd_data: si ESTE ciclo un write-hit local
+        // (fsm_data_wr_en) cae en el mismo set que necesita el puerto de
+        // lectura de snoop, sin este forward snoop_rd_data lee el `mem[]`
+        // VIEJO (non-blocking: la escritura de este mismo ciclo recién se
+        // ve el ciclo siguiente) -- si justo esa línea entra a SNP_WB en
+        // el MISMO ciclo que el write-hit local la deja dirty (ver
+        // mem_owner_r/core_rsp_fire: un local S_IDLE->S_HIT y un snoop
+        // SNP_IDLE->SNP_WB SÍ pueden coincidir exactamente así, son FSMs
+        // independientes, A-8), el flush manda el dato VIEJO (sin este
+        // write) a L2 y encima la línea queda invalidada -- el dato recién
+        // escrito, aunque SIGUE en este `mem[]`, queda inalcanzable
+        // (encontrado en Fase B, ver docs/proposals/
+        // tfg_fase_b_integration_blocker.md §5: dos resultados de 1024
+        // quedaban en poison pese a que el write-hit local se veía
+        // correcto en la traza). data_rd_data no necesita el mismo
+        // bypass: lo arma la misma FSM local que escribe, nunca puede
+        // pedir el MISMO set el mismo ciclo que lo escribe (S_IDLE solo
+        // vuelve a aceptar una petición nueva un ciclo después de que el
+        // write ya se vea en `mem[]`).
+        wire snoop_rd_bypass = data_wr_en[w] && (data_wr_set[w] == snoop_array_set_addr);
+
         always_ff @(posedge clk) begin
             if (data_wr_en[w])
                 mem[data_wr_set[w]] <= data_wr_data[w];
             data_rd_data[w]  <= mem[array_set_addr];
-            snoop_rd_data[w] <= mem[snoop_array_set_addr];
+            snoop_rd_data[w] <= snoop_rd_bypass ? data_wr_data[w] : mem[snoop_array_set_addr];
         end
     end
 
@@ -525,7 +546,7 @@ module l1_cache import VX_gpu_pkg::*; #(
                                     `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(upgrade): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                                 end else begin
                                     state <= S_HIT;
-                                    `TRACE(2, ("%t: %s S_IDLE->S_HIT: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                                    `TRACE(2, ("%t: %s S_IDLE->S_HIT: addr={%0h,%0h}, rw=%0d, off=%0d, byteen=%0h, wdata=%0h\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw, core_bus_if.req_data.addr[OFFSET_BITS-1:0], core_bus_if.req_data.byteen, core_bus_if.req_data.data))
                                 end
                             end else if (tag_array[req_set][victim_way].valid
                                       && tag_array[req_set][victim_way].dirty) begin
@@ -557,9 +578,9 @@ module l1_cache import VX_gpu_pkg::*; #(
                     end
                 end
                 S_WB: begin
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                    if (core_req_fire)
                         mem_req_sent_core_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                    if (core_rsp_fire) begin
                         mem_req_sent_core_r <= 1'b0;
                         state               <= S_SNOOP_QUERY;  // ahora sí, consultar antes de llenar
                         `TRACE(2, ("%t: %s S_WB->S_SNOOP_QUERY: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
@@ -577,13 +598,13 @@ module l1_cache import VX_gpu_pkg::*; #(
                     end
                 end
                 S_MISS_WAIT: begin
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                    if (core_req_fire)
                         mem_req_sent_core_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                    if (core_rsp_fire) begin
                         mem_req_sent_core_r <= 1'b0;
                         fetched_line_r      <= mem_bus_if.rsp_data.data;
                         state               <= S_FILL;
-                        `TRACE(2, ("%t: %s S_MISS_WAIT->S_FILL: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
+                        `TRACE(2, ("%t: %s S_MISS_WAIT->S_FILL: addr={%0h,%0h}, fetched=%0h\n", $time, INSTANCE_ID, req_tag_r, req_set_r, mem_bus_if.rsp_data.data))
                     end
                 end
                 S_FILL: begin
@@ -619,9 +640,9 @@ module l1_cache import VX_gpu_pkg::*; #(
                     // real de l2_cache.sv). Ver mem_owner_r/core_wants_mem
                     // más abajo: S_FLUSH_WB participa del mismo árbitro
                     // entre el camino local y el de snoop.
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                    if (core_req_fire)
                         mem_req_sent_core_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                    if (core_rsp_fire) begin
                         mem_req_sent_core_r <= 1'b0;
                         `TRACE(2, ("%t: %s S_FLUSH_WB volco: addr={%0h,%0h}\n", $time, INSTANCE_ID, flush_tag_r, flush_set_r))
                         if (flush_last_entry) begin
@@ -640,9 +661,9 @@ module l1_cache import VX_gpu_pkg::*; #(
                     // arriba que VX_dcr_flush.sv usa de arriba hacia abajo
                     // contra este mismo módulo). Participa del mismo
                     // mem_owner_r que S_WB/S_MISS_WAIT/S_FLUSH_WB.
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                    if (core_req_fire)
                         mem_req_sent_core_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                    if (core_rsp_fire) begin
                         mem_req_sent_core_r <= 1'b0;
                         state               <= S_FLUSH_DONE;
                         `TRACE(2, ("%t: %s S_FLUSH_L2->S_FLUSH_DONE: L2 confirmo su propio flush\n", $time, INSTANCE_ID))
@@ -671,6 +692,9 @@ module l1_cache import VX_gpu_pkg::*; #(
         end else begin
             case (snp_state)
                 SNP_IDLE: begin
+                    if (snoop_bus_if.snoop_valid) begin
+                        `TRACE(2, ("%t: %s SNP_IDLE snoop_valid: addr={%0h,%0h}, tag_hit=%0d, way=%0d, mesi=%0d\n", $time, INSTANCE_ID, snoop_tag, snoop_set, snoop_tag_hit, snoop_hit_way, snoop_tag_hit ? tag_array[snoop_set][snoop_hit_way].mesi : 2'bxx))
+                    end
                     if (snoop_bus_if.snoop_valid && snoop_tag_hit) begin
                         // La transición MESI en sí (E->S, E->I/S->I) la
                         // aplica el always_ff de tag_array de más arriba
@@ -701,9 +725,11 @@ module l1_cache import VX_gpu_pkg::*; #(
                     // pidió el snoop (snoop_way_r/snoop_set_r/snoop_tag_r),
                     // no la víctima de un miss local. La transición
                     // M->E en sí la aplica el always_ff de tag_array.
-                    if (mem_bus_if.req_valid && mem_bus_if.req_ready)
+                    if (snoop_req_fire) begin
                         mem_req_sent_snoop_r <= 1'b1;
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+                        `TRACE(2, ("%t: %s SNP_WB volco: addr={%0h,%0h}, data=%0h\n", $time, INSTANCE_ID, snoop_tag_r, snoop_set_r, mem_bus_if.req_data.data))
+                    end
+                    if (snoop_rsp_fire) begin
                         mem_req_sent_snoop_r <= 1'b0;
                         snp_state            <= SNP_POST_WB;
                     end
@@ -750,24 +776,57 @@ module l1_cache import VX_gpu_pkg::*; #(
     wire core_wants_mem  = (state == S_WB) || (state == S_MISS_WAIT) || (state == S_FLUSH_WB) || (state == S_FLUSH_L2);
     wire snoop_wants_mem = (snp_state == SNP_WB);
 
+    // mem_bus_if.rsp_valid es un solo cable compartido -- sin este chequeo
+    // de dueño, el lado que esté ESPERANDO (p.ej. SNP_WB sin haber llegado
+    // a tener mem_owner_r todavía) confunde la respuesta ajena del dueño
+    // ACTUAL (core_rsp_fire/snoop_rsp_fire) con la propia, avanza su FSM
+    // sin haber mandado nunca su propio request, y la línea se da por
+    // volcada/traída sin que el dato haya ido a ningún lado -- encontrado
+    // en Fase B (ver docs/proposals/tfg_fase_b_integration_blocker.md §5):
+    // un snoop a una línea M que coincidía con un miss local en vuelo
+    // "completaba" su flush con la respuesta del miss local, perdiendo el
+    // dato sucio sin que L2 lo viera nunca.
+    wire core_rsp_fire  = mem_bus_if.rsp_valid && mem_bus_if.rsp_ready && (mem_owner_r == MEM_CORE);
+    wire snoop_rsp_fire = mem_bus_if.rsp_valid && mem_bus_if.rsp_ready && (mem_owner_r == MEM_SNOOP);
+
+    // Mismo problema que rsp_valid, pero del lado del request: cuando
+    // mem_owner_r==MEM_CORE, req_valid está en alto por las razones de
+    // CORE -- un chequeo de SNP_WB que no mire mem_owner_r lo malinterpreta
+    // como "mi propio request salió", marca mem_req_sent_snoop_r en 1 sin
+    // haber mandado nada, y después de eso req_valid del lado snoop queda
+    // bloqueado para siempre (su propia condición exige
+    // !mem_req_sent_snoop_r) -- deadlock real, encontrado en Fase B al
+    // corregir el problema simétrico de rsp_valid (ver core_rsp_fire más
+    // arriba): corregir un lado sin el otro simplemente cambia DONDE se
+    // pierde el dato por una confusión de dueño.
+    wire core_req_fire  = mem_bus_if.req_valid && mem_bus_if.req_ready && (mem_owner_r == MEM_CORE);
+    wire snoop_req_fire = mem_bus_if.req_valid && mem_bus_if.req_ready && (mem_owner_r == MEM_SNOOP);
+
     always_ff @(posedge clk) begin
         if (reset) begin
             mem_owner_r <= MEM_NONE;
         end else begin
             case (mem_owner_r)
                 MEM_NONE: begin
-                    if (snoop_wants_mem)
+                    if (snoop_wants_mem) begin
                         mem_owner_r <= MEM_SNOOP;
-                    else if (core_wants_mem)
+                        `TRACE(2, ("%t: %s mem_owner NONE->SNOOP: snp_state=%0d\n", $time, INSTANCE_ID, snp_state))
+                    end else if (core_wants_mem) begin
                         mem_owner_r <= MEM_CORE;
+                        `TRACE(2, ("%t: %s mem_owner NONE->CORE: state=%0d\n", $time, INSTANCE_ID, state))
+                    end
                 end
                 MEM_CORE: begin
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready)
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
                         mem_owner_r <= MEM_NONE;
+                        `TRACE(2, ("%t: %s mem_owner CORE->NONE: mem_req_sent_core_r=%0d\n", $time, INSTANCE_ID, mem_req_sent_core_r))
+                    end
                 end
                 MEM_SNOOP: begin
-                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready)
+                    if (mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
                         mem_owner_r <= MEM_NONE;
+                        `TRACE(2, ("%t: %s mem_owner SNOOP->NONE: mem_req_sent_snoop_r=%0d, snp_state=%0d\n", $time, INSTANCE_ID, mem_req_sent_snoop_r, snp_state))
+                    end
                 end
                 default: mem_owner_r <= MEM_NONE;
             endcase
@@ -841,7 +900,7 @@ module l1_cache import VX_gpu_pkg::*; #(
         fsm_data_wr_line = hit_line_new;
         if (state == S_HIT && req_rw_r) begin
             fsm_data_wr_en = 1'b1;              // write-hit: guarda la línea mezclada
-        end else if (state == S_MISS_WAIT && mem_bus_if.rsp_valid && mem_bus_if.rsp_ready) begin
+        end else if (state == S_MISS_WAIT && core_rsp_fire) begin
             fsm_data_wr_en   = 1'b1;            // fill: guarda la línea (mezclada si era write)
             fsm_data_wr_way  = victim_way_r;
             fsm_data_wr_line = req_rw_r ? fill_line_new : fill_line_old;
