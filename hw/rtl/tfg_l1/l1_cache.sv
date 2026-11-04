@@ -448,9 +448,21 @@ module l1_cache import VX_gpu_pkg::*; #(
                     end
                 end
                 S_HIT: begin
-                    if (core_bus_if.rsp_ready) begin
+                    // Una escritura no ofrece nada por core_bus_if.rsp_valid
+                    // (fire-and-forget, A-9) -- esperar rsp_ready igual no
+                    // tiene sentido: no hay nada que el consumidor tenga que
+                    // aceptar. Antes de este fix, un write-hit salía rápido
+                    // "por suerte" (1 ciclo, rsp_ready casi siempre arriba en
+                    // los tests chicos de A-9/A-14/A-17) pero un write-miss
+                    // real (más ciclos hasta llegar acá) podía caer en una
+                    // ventana real donde rsp_ready baja por motivos ajenos
+                    // del pipeline y nunca vuelve -- encontrado en Fase B con
+                    // un write-miss real contra VX_core (nunca antes
+                    // ejercitado en este TFG). Solo una lectura (que sí
+                    // levanta rsp_valid) tiene que esperar de verdad.
+                    if (req_rw_r || core_bus_if.rsp_ready) begin
                         state <= S_IDLE;
-                        `TRACE(2, ("%t: %s S_HIT->S_IDLE: rsp_valid=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid))
+                        `TRACE(2, ("%t: %s S_HIT->S_IDLE: rsp_valid=%0d, req_rw_r=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid, req_rw_r))
                     end
                 end
                 S_WB: begin
@@ -484,7 +496,10 @@ module l1_cache import VX_gpu_pkg::*; #(
                     end
                 end
                 S_FILL: begin
-                    if (core_bus_if.rsp_ready) begin
+                    // Mismo motivo que S_HIT más arriba: un write-allocate
+                    // fill no levanta rsp_valid (fire-and-forget), así que
+                    // no tiene sentido esperar rsp_ready.
+                    if (req_rw_r || core_bus_if.rsp_ready) begin
                         state <= S_IDLE;
                         `TRACE(2, ("%t: %s S_FILL->S_IDLE: rsp_valid=%0d, req_rw_r=%0d\n", $time, INSTANCE_ID, core_bus_if.rsp_valid, req_rw_r))
                     end
@@ -758,6 +773,25 @@ module l1_cache import VX_gpu_pkg::*; #(
     assign snoop_mst_if.snoop_valid = (state == S_SNOOP_QUERY);
     assign snoop_mst_if.snoop_addr  = {req_tag_r, req_set_r};
     assign snoop_mst_if.snoop_rw    = req_rw_r;
+
+    // ------------------------------------------------------------------
+    // Debug temporal (Fase B, bloqueante de S_FILL): core_bus_if.rsp_ready
+    // es una señal de ENTRADA real del VX_core -- no hace falta tocar
+    // ningún archivo stock para observarla, ya es un puerto de este
+    // módulo. Dispara por flanco (no por ciclo) para no inundar el log
+    // aunque el stall dure cientos de miles de ciclos.
+    // ------------------------------------------------------------------
+    logic rsp_ready_prev_r;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            rsp_ready_prev_r <= 1'b0;
+        end else begin
+            if (core_bus_if.rsp_ready != rsp_ready_prev_r) begin
+                `TRACE(2, ("%t: %s core_bus_if.rsp_ready edge: %0d->%0d, state=%0d, req_valid=%0d\n", $time, INSTANCE_ID, rsp_ready_prev_r, core_bus_if.rsp_ready, state, core_bus_if.req_valid))
+            end
+            rsp_ready_prev_r <= core_bus_if.rsp_ready;
+        end
+    end
 
 /* verilator lint_on UNUSEDPARAM */
 /* verilator lint_on UNUSEDSIGNAL */

@@ -300,9 +300,23 @@ module l2_cache import VX_gpu_pkg::*; #(
                             state <= S_IDLE;
                     end
                     S_WB: begin
-                        if (mem_req_fire) mem_req_sent_r <= 1'b1;
-                        if (mem_rsp_fire) begin
-                            mem_req_sent_r <= 1'b0;
+                        // mem_bus_if[b].req_data.rw == (state==S_WB) siempre
+                        // -- este estado SOLO manda escrituras (el volcado
+                        // del víctima sucio). A diferencia de S_MISS_WAIT
+                        // (una lectura real, con datos que sí hay que
+                        // esperar), acá no hay nada que recibir de vuelta:
+                        // el harness de simulación stock (sim/rtlsim/
+                        // processor.cpp: "if (!mem_rsp->write) { ...
+                        // mem_rsp_valid = 1; }") directamente NUNCA levanta
+                        // rsp_valid para una escritura real hacia memoria --
+                        // es fire-and-forget por diseño en ese límite, no
+                        // una demora. Esperar mem_rsp_fire acá colgaba esta
+                        // L2 para siempre en el primer writeback real
+                        // (encontrado en Fase B -- A-11/A-14/A-16/A-17 nunca
+                        // habían forzado un desalojo sucio hasta la memoria
+                        // de verdad, solo contra mocks de C++ o sin L3/DRAM
+                        // real de por medio).
+                        if (mem_req_fire) begin
                             // si lo pendiente era un write, ya tiene los datos
                             // (req_wdata_r) -- asienta directo; si era un read,
                             // ahora sí hace falta ir a buscar la línea nueva.
@@ -431,6 +445,18 @@ module l2_cache import VX_gpu_pkg::*; #(
         // banco alcanza con 0.
         assign mem_bus_if[b].req_data.tag    = '0;
         assign mem_bus_if[b].rsp_ready       = (state == S_WB) || (state == S_MISS_WAIT);
+
+        // Debug temporal (Fase B, bloqueante de S_WB tras el primer
+        // writeback real a memoria): confirma si mem_bus_if[b].rsp_valid
+        // llega alguna vez después de un req de escritura -- señal de
+        // ENTRADA real de este módulo, no hace falta tocar nada stock.
+        logic mem_req_was_write_r;
+        always_ff @(posedge clk) begin
+            if (mem_req_fire) mem_req_was_write_r <= mem_bus_if[b].req_data.rw;
+            if (mem_bus_if[b].rsp_valid) begin
+                `TRACE(2, ("%t: %s-bank%0d mem_bus_if rsp_valid: was_write=%0d, state=%0d\n", $time, INSTANCE_ID, b, mem_req_was_write_r, state))
+            end
+        end
 
     end
 
