@@ -92,6 +92,16 @@ module VX_snoop_bus_top import VX_gpu_pkg::*; #(
     VX_snoop_bus_if #(.ADDR_WIDTH(MEM_ADDR_WIDTH), .LINE_SIZE(LINE_SIZE)) snp_if [NUM_L1] ();
     VX_snoop_bus_if #(.ADDR_WIDTH(MEM_ADDR_WIDTH), .LINE_SIZE(LINE_SIZE)) mst_if [NUM_L1] ();
 
+    // Este test ejercita el protocolo de snoop en sí (incluido A-11, el
+    // "mismo ciclo" documentado), no la pérdida de datos por miss
+    // concurrente (eso lo prueba l1_l2_coherence, que sí tiene l2_cache
+    // real para verificar el merge final) -- otorgar siempre al instante
+    // preserva el comportamiento ya probado de este test sin cambios.
+    VX_line_lock_if #(.ADDR_WIDTH(MEM_ADDR_WIDTH)) lock_if [NUM_L1] ();
+    for (genvar i = 0; i < NUM_L1; ++i) begin : g_lock_tieoff
+        assign lock_if[i].req_ready = 1'b1;
+    end
+
     // ---- L1 #0 <-> puertos planos ----
     assign core0_bus_if.req_valid       = core0_req_valid;
     assign core0_bus_if.req_data.rw     = core0_req_rw;
@@ -157,7 +167,8 @@ module VX_snoop_bus_top import VX_gpu_pkg::*; #(
         .core_bus_if  (core0_bus_if),
         .mem_bus_if   (mem0_bus_if),
         .snoop_bus_if (snp_if[0]),
-        .snoop_mst_if (mst_if[0])
+        .snoop_mst_if (mst_if[0]),
+        .lock_if      (lock_if[0])
     );
 
     l1_cache #(
@@ -173,7 +184,8 @@ module VX_snoop_bus_top import VX_gpu_pkg::*; #(
         .core_bus_if  (core1_bus_if),
         .mem_bus_if   (mem1_bus_if),
         .snoop_bus_if (snp_if[1]),
-        .snoop_mst_if (mst_if[1])
+        .snoop_mst_if (mst_if[1]),
+        .lock_if      (lock_if[1])
     );
 
     snoop_bus #(

@@ -193,6 +193,25 @@ module tfg_cluster import VX_gpu_pkg::*; #(
     );
 
     // ------------------------------------------------------------------
+    // line_lock: candado por línea entre las NUM_CORES l1_cache.sv (ver
+    // VX_line_lock_if.sv / line_lock.sv) -- cierra la carrera de miss
+    // concurrente sobre la misma línea entre distintos núcleos, encontrada
+    // con sgemm (ver docs/proposals/tfg_cluster_baseline_comparison.md).
+    // ------------------------------------------------------------------
+    VX_line_lock_if #(
+        .ADDR_WIDTH (TFG_L1_MEM_ADDR_WIDTH)
+    ) l1_lock_if [NUM_CORES] ();
+
+    line_lock #(
+        .NUM_L1     (NUM_CORES),
+        .ADDR_WIDTH (TFG_L1_MEM_ADDR_WIDTH)
+    ) lock (
+        .clk    (clk),
+        .reset  (reset),
+        .req_if (l1_lock_if)
+    );
+
+    // ------------------------------------------------------------------
     // L2 compartida (datos): un core_bus_if por L1.
     // ------------------------------------------------------------------
     VX_mem_bus_if #(
@@ -344,7 +363,8 @@ module tfg_cluster import VX_gpu_pkg::*; #(
             .core_bus_if  (dcache_bus_if[0]),
             .mem_bus_if   (l1_to_l2_bus_if[i]),
             .snoop_bus_if (l1_broadcast_if[i]),
-            .snoop_mst_if (l1_own_query_if[i])
+            .snoop_mst_if (l1_own_query_if[i]),
+            .lock_if      (l1_lock_if[i])
         );
 
         VX_core #(

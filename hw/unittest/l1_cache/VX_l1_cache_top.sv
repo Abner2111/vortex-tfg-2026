@@ -113,6 +113,14 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
         .LINE_SIZE  (LINE_SIZE)
     ) snoop_mst_if();
 
+    // Un solo núcleo en este testbench aislado -- sin contención real
+    // posible, así que el candado se otorga siempre al instante (mismo
+    // criterio que snoop_mst_if arriba: "nadie más conectado").
+    VX_line_lock_if #(
+        .ADDR_WIDTH (MEM_ADDR_WIDTH)
+    ) lock_if();
+    assign lock_if.req_ready = 1'b1;
+
     assign core_bus_if.req_valid       = core_req_valid;
     assign core_bus_if.req_data.rw     = core_req_rw;
     assign core_bus_if.req_data.byteen = core_req_byteen;
@@ -171,7 +179,8 @@ module VX_l1_cache_top import VX_gpu_pkg::*; #(
         .core_bus_if  (core_bus_if),
         .mem_bus_if   (mem_bus_if),
         .snoop_bus_if (snoop_bus_if),
-        .snoop_mst_if (snoop_mst_if)
+        .snoop_mst_if (snoop_mst_if),
+        .lock_if      (lock_if)
     );
 
     assign dbg_mesi_way0  = dut.tag_array[0][0].mesi;

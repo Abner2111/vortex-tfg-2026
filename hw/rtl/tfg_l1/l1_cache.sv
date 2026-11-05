@@ -37,7 +37,8 @@ module l1_cache import VX_gpu_pkg::*; #(
     VX_mem_bus_if.slave      core_bus_if,
     VX_mem_bus_if.master     mem_bus_if,
     VX_snoop_bus_if.snooper  snoop_bus_if,
-    VX_snoop_bus_if.master   snoop_mst_if
+    VX_snoop_bus_if.master   snoop_mst_if,
+    VX_line_lock_if.master   lock_if
 );
 
     // ------------------------------------------------------------------
@@ -313,6 +314,23 @@ module l1_cache import VX_gpu_pkg::*; #(
     //   S_WB        -> vuelca la línea víctima (dirty) a mem_bus_if antes
     //                  de pedir la línea nueva — si no, esos datos se
     //                  pierden sin más. Solo se visita si victim_dirty.
+    //   S_MISS_LOCK -> reserva la línea nueva contra line_lock.sv ANTES de
+    //                  consultar el snoop bus (ver VX_line_lock_if.sv) --
+    //                  sin esto, dos núcleos pueden hacer miss sobre la
+    //                  MISMA línea al mismo tiempo, cada uno viendo "nadie
+    //                  la tiene todavía" (verdad en ese instante, el fill
+    //                  del otro tarda muchos ciclos más en confirmar en su
+    //                  tag_array) y terminar cada uno creyéndose dueño
+    //                  exclusivo con solo su propia palabra escrita --
+    //                  encontrado con `sgemm` (reuso real cross-core,
+    //                  ver docs/proposals/tfg_cluster_baseline_comparison.md
+    //                  y tfg_mesi_coherence_design.md §9). Solo el camino
+    //                  de MISS pasa por acá -- un upgrade S->M (b, abajo)
+    //                  no vuelve a traer datos de memoria, no puede perder
+    //                  nada por esta carrera. Se libera (lock_if.rel_valid)
+    //                  en S_MISS_WAIT, en el mismo ciclo en que el fill ya
+    //                  confirma en tag_array -- cualquier consulta que
+    //                  llegue después ya ve la línea actualizada.
     //   S_HIT       -> data_rd_data[hit_way_r] ya está listo (el read
     //                  síncrono del data array arrancó en S_IDLE). Sirve
     //                  la palabra pedida, o la mezcla con req_wdata_r si
@@ -337,13 +355,14 @@ module l1_cache import VX_gpu_pkg::*; #(
     //   la misma línea (mismo set y vía) en el mismo ciclo, las dos
     //   escrituras a tag_array (una desde `state`, otra desde `snp_state`)
     //   compiten dentro del mismo always_ff — la que está más abajo en el
-    //   código gana (last-write-wins). Es un caso de borde raro (necesita
-    //   colisión exacta de dirección, no solo de timing) y no es el
-    //   deadlock que A-8 pide resolver — ver docs/proposals/
-    //   tfg_mesi_coherence_design.md §9 para el análisis completo y por
-    //   qué se dejó fuera de esta pasada (arreglarlo bien necesita un
-    //   candado por línea al estilo MSHR, un cambio de otro tamaño). La
-    //   misma carrera, en teoría, podría tocar una línea que S_FLUSH está
+    //   código gana (last-write-wins). Es un caso de borde MUY angosto
+    //   (colisión exacta de CICLO, no solo de dirección) y no es el
+    //   deadlock que A-8 pide resolver, ni el candado de línea de
+    //   S_MISS_LOCK/line_lock.sv de arriba (eso resuelve la carrera MÁS
+    //   ANCHA de misses concurrentes repartidos en MUCHOS ciclos -- ver
+    //   docs/proposals/tfg_mesi_coherence_design.md §9, encontrado y
+    //   cerrado con `sgemm`). Esta carrera de un solo ciclo sigue abierta
+    //   -- la misma, en teoría, podría tocar una línea que S_FLUSH está
     //   recorriendo en ese instante -- mismo límite conocido, no uno nuevo.
     //
     //   S_FLUSH/S_FLUSH_WB/S_FLUSH_DONE (Fase B): atienden un fence real
@@ -399,7 +418,7 @@ module l1_cache import VX_gpu_pkg::*; #(
     //                  el pipeline queda bloqueado para siempre).
     // ------------------------------------------------------------------
     typedef enum logic [3:0] {
-        S_IDLE, S_HIT, S_WB, S_MISS_WAIT, S_FILL, S_SNOOP_QUERY,
+        S_IDLE, S_HIT, S_WB, S_MISS_LOCK, S_MISS_WAIT, S_FILL, S_SNOOP_QUERY,
         S_FLUSH, S_FLUSH_WB, S_FLUSH_L2, S_FLUSH_DONE
     } state_t;
     state_t state;
@@ -494,8 +513,35 @@ module l1_cache import VX_gpu_pkg::*; #(
 
     // Ya no depende de `snp_state`: con las dos FSM separadas, aceptar
     // una petición local nueva no tiene por qué esperar a que termine de
-    // resolverse un snoop remoto (A-8) -- solo importa el propio `state`.
-    assign core_bus_if.req_ready = (state == S_IDLE);
+    // resolverse un snoop remoto (A-8) -- solo importa el propio `state`,
+    // CON UNA excepción puntual (ver local_snoop_conflict más abajo):
+    // mientras snp_state está resolviendo (SNP_WB/SNP_POST_WB/SNP_DONE)
+    // la MISMA entrada {set,vía} que un write-hit local acaba de pedir,
+    // aceptar YA ese write-hit corre el riesgo exacto que
+    // tfg_mesi_coherence_design.md §9 documenta: las dos mutaciones a
+    // tag_array (dirty<=1,mesi<=M desde `state` y dirty<=0,mesi<=E/
+    // valid<=0 desde `snp_state`) compiten en el MISMO ciclo -- la de
+    // snoop, más abajo en el archivo, gana (last-write-wins) y el write
+    // que SÍ llegó a escribirse en el data array (fsm_data_wr_en no
+    // tiene este problema, es incondicional) queda marcado como limpio
+    // -- nunca se vuelve a flushear, perdido para siempre. Encontrado en
+    // Fase B con `diverge` real tras cerrar la carrera de miss
+    // concurrente (line_lock.sv/S_MISS_LOCK): esa serialización corrió
+    // justo el timing que hacía falta para que ESTA carrera, mucho más
+    // angosta (coincidencia de CICLO, no solo de dirección), se volviera
+    // alcanzable de verdad. Mientras dure el conflicto, no se acepta el
+    // request -- el pipeline reintenta; para cuando snp_state libere la
+    // entrada, `tag_hit`/`mesi` ya reflejan el resultado correcto del
+    // snoop (I si invalidó, S si solo compartió) y el camino normal
+    // (miss-refetch o upgrade S->M) lo resuelve bien, sin repetir la
+    // carrera. No cubre el caso (no observado) de un MISS local cuyo
+    // victim_way coincide por casualidad con la vía que snoop está
+    // resolviendo en ese instante -- mismo límite conocido que el resto
+    // de esta carrera, ver docs/proposals/tfg_mesi_coherence_design.md §9.
+    wire snoop_entry_busy      = (snp_state == SNP_WB) || (snp_state == SNP_POST_WB) || (snp_state == SNP_DONE);
+    wire local_snoop_conflict  = snoop_entry_busy && tag_hit
+                                && (req_set == snoop_set_r) && (hit_way == snoop_way_r);
+    assign core_bus_if.req_ready = (state == S_IDLE) && !local_snoop_conflict;
 
     // ---- recorrido de S_FLUSH: siguiente entrada + chequeo dirty de la actual ----
     wire flush_last_way     = (flush_way_r == WAY_BITS'(NUM_WAYS-1));
@@ -553,8 +599,8 @@ module l1_cache import VX_gpu_pkg::*; #(
                                 state <= S_WB;          // hay que desalojar algo sucio primero
                                 `TRACE(2, ("%t: %s S_IDLE->S_WB: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                             end else begin
-                                state <= S_SNOOP_QUERY;  // miss: consultar antes de llenar
-                                `TRACE(2, ("%t: %s S_IDLE->S_SNOOP_QUERY(miss): addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
+                                state <= S_MISS_LOCK;   // miss: reservar la línea antes de consultar
+                                `TRACE(2, ("%t: %s S_IDLE->S_MISS_LOCK: addr={%0h,%0h}, rw=%0d\n", $time, INSTANCE_ID, req_tag, req_set, core_bus_if.req_data.rw))
                             end
                         end
                     end
@@ -582,8 +628,18 @@ module l1_cache import VX_gpu_pkg::*; #(
                         mem_req_sent_core_r <= 1'b1;
                     if (core_rsp_fire) begin
                         mem_req_sent_core_r <= 1'b0;
-                        state               <= S_SNOOP_QUERY;  // ahora sí, consultar antes de llenar
-                        `TRACE(2, ("%t: %s S_WB->S_SNOOP_QUERY: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
+                        state               <= S_MISS_LOCK;  // ahora sí, reservar antes de consultar
+                        `TRACE(2, ("%t: %s S_WB->S_MISS_LOCK: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
+                    end
+                end
+                S_MISS_LOCK: begin
+                    // lock_if.req_valid se mantiene alto (ver assign más
+                    // abajo) hasta que line_lock.sv otorgue req_ready --
+                    // misma disciplina valid/ready que S_SNOOP_QUERY usa
+                    // contra snoop_bus.sv.
+                    if (lock_if.req_valid && lock_if.req_ready) begin
+                        state <= S_SNOOP_QUERY;
+                        `TRACE(2, ("%t: %s S_MISS_LOCK->S_SNOOP_QUERY: addr={%0h,%0h}\n", $time, INSTANCE_ID, req_tag_r, req_set_r))
                     end
                 end
                 S_SNOOP_QUERY: begin
@@ -1000,6 +1056,17 @@ module l1_cache import VX_gpu_pkg::*; #(
     assign snoop_mst_if.snoop_valid = (state == S_SNOOP_QUERY);
     assign snoop_mst_if.snoop_addr  = {req_tag_r, req_set_r};
     assign snoop_mst_if.snoop_rw    = req_rw_r;
+
+    // ------------------------------------------------------------------
+    // line_lock.sv (ver S_MISS_LOCK más arriba): reserva la línea ANTES
+    // de consultar, la libera en el MISMO ciclo en que S_MISS_WAIT ya
+    // confirma el fill en tag_array (misma condición, core_rsp_fire) --
+    // así, cualquier consulta que llegue después del release ya ve el
+    // tag_array actualizado.
+    // ------------------------------------------------------------------
+    assign lock_if.req_valid = (state == S_MISS_LOCK);
+    assign lock_if.req_addr  = {req_tag_r, req_set_r};
+    assign lock_if.rel_valid = (state == S_MISS_WAIT) && core_rsp_fire;
 
     // ------------------------------------------------------------------
     // Debug temporal (Fase B, bloqueante de S_FILL): core_bus_if.rsp_ready

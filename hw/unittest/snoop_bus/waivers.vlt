@@ -4,3 +4,7 @@
 // compartido por todo Vortex, así que sus waivers van acá (scoped a este
 // proyecto) en vez de con pragmas inline en el archivo compartido.
 lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
+
+// Los dos lock_if de este test se atan a req_ready=1'b1 directo (ver
+// VX_snoop_bus_top.sv) -- req_addr/rel_valid quedan sin leer.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/tfg_l1/VX_line_lock_if.sv"

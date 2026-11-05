@@ -8,3 +8,9 @@
 // cada TODO de l1_cache.sv se implemente y los campos se empiecen a usar.
 lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/mem/VX_mem_bus_if.sv"
 lint_off -rule UNDRIVEN     -file "*/hw/rtl/tfg_l1/VX_snoop_bus_if.sv"
+
+// Un solo núcleo en este testbench aislado: lock_if.req_ready se ata
+// directo a 1'b1 (sin contención real posible, ver VX_l1_cache_top.sv),
+// así que req_addr/rel_valid quedan sin leer -- a diferencia de
+// line_lock.sv real, que sí los usa.
+lint_off -rule UNUSEDSIGNAL -file "*/hw/rtl/tfg_l1/VX_line_lock_if.sv"

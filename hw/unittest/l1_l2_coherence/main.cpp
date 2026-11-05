@@ -32,6 +32,19 @@
 // misma línea después (su propio miss, nadie más la tiene) y la trae de
 // L2. Prueba que L2 maneja bien las DOS vías de writeback (flush por
 // snoop vs. desalojo local), no solo la que menciona A-17 textualmente.
+//
+// Escenario C (line_lock.sv): core0 y core1 hacen write-miss EXACTAMENTE
+// el mismo ciclo sobre la MISMA línea, palabras distintas (mismo tag y
+// set, offset 0 vs 1). Sin el candado por línea, los dos pueden ver
+// "nadie la tiene todavía" (remote_hit=0) y terminar cada uno creyéndose
+// dueño exclusivo con solo su propia palabra -- la otra, todavía poison
+// -- encontrado con `sgemm` (reuso real cross-core) perdiendo datos de
+// verdad, ver docs/proposals/tfg_cluster_baseline_comparison.md y
+// tfg_mesi_coherence_design.md §9. Verifica que, tras la carrera, AMBAS
+// palabras llegan correctas -- una releída localmente (core1, su propia
+// escritura más la de core0 que debió llegarle por snoop+fill) y la
+// otra releída desde CERO por el otro núcleo (core0, fuerza un viaje
+// real a L2 -- confirma que el dato persistió ahí, no solo en un L1).
 
 #include "vl_simulator.h"
 #include "VVX_l1_l2_top.h"
@@ -232,6 +245,65 @@ int main(int argc, char **argv) {
   ok = do_read1(sim, ticks, st0, st1, mem, kAddrY, 6, rback,
                 "core1 read addrY (nadie mas la tiene -- miss puro, trae de L2 lo que el desalojo local volco)");
   check(ok && rback == kDataY, "core1 trajo de L2 el dato volcado por el desalojo local (writeback sin snoop)");
+
+  // ------------------------------------------------------------------
+  // Escenario C (line_lock.sv): write-miss simultaneo de core0 y core1
+  // sobre la MISMA linea, palabras distintas -- ver comentario de
+  // cabecera.
+  // ------------------------------------------------------------------
+  ticks = sim.reset(ticks);
+  sim->core0_rsp_ready = 1;
+  sim->core1_rsp_ready = 1;
+  st0 = MemPortState();
+  st1 = MemPortState();
+  mem.clear();
+
+  // tag2,set0 para ambas -- offset0 (core0) vs offset1 (core1): MISMA
+  // linea, palabras distintas (ver comentario de direcciones arriba).
+  const uint32_t kAddrRaceA = 8;
+  const uint32_t kAddrRaceB = 9;
+  const uint32_t kDataRaceA = 0xAAAA0A0A;
+  const uint32_t kDataRaceB = 0xBBBB0B0B;
+
+  sim->core0_req_valid  = 1;
+  sim->core0_req_rw     = 1;
+  sim->core0_req_addr   = kAddrRaceA;
+  sim->core0_req_data   = kDataRaceA;
+  sim->core0_req_byteen = 0xF;
+  sim->core0_req_tag    = 10;
+
+  sim->core1_req_valid  = 1;
+  sim->core1_req_rw     = 1;
+  sim->core1_req_addr   = kAddrRaceB;
+  sim->core1_req_data   = kDataRaceB;
+  sim->core1_req_byteen = 0xF;
+  sim->core1_req_tag    = 11;
+
+  std::printf("=== core0 (addrRaceA) y core1 (addrRaceB) escriben la MISMA linea, "
+              "palabras distintas, EXACTAMENTE el mismo ciclo ===\n");
+  bool got0c = false, got1c = false, acc0c = false, acc1c = false;
+  for (int i = 0; i < 80 && !(got0c && got1c); ++i) {
+    step_both_mem(sim, ticks, st0, st1, mem);
+    if (!got0c) {
+      if (!acc0c) { if (!sim->core0_req_ready) acc0c = true; }
+      else if (sim->core0_req_ready) got0c = true;
+    }
+    if (!got1c) {
+      if (!acc1c) { if (!sim->core1_req_ready) acc1c = true; }
+      else if (sim->core1_req_ready) got1c = true;
+    }
+  }
+  sim->core0_req_valid = 0;
+  sim->core1_req_valid = 0;
+  check(got0c && got1c, "ambas escrituras (misma linea, mismo ciclo) respondieron");
+
+  ok = do_read1(sim, ticks, st0, st1, mem, kAddrRaceA, 12, rback,
+                "core1 relee addrRaceA (la palabra de core0, via snoop+fill o localmente)", 200);
+  check(ok && rback == kDataRaceA, "core1 tiene la palabra de core0 correcta (no quedo en poison)");
+
+  ok = do_read0(sim, ticks, st0, st1, mem, kAddrRaceB, 13, rback,
+                "core0 relee addrRaceB desde CERO (fuerza un viaje real a L2)", 200);
+  check(ok && rback == kDataRaceB, "la palabra de core1 persistio correcta en L2 (no la piso un flush incompleto)");
 
   if (fails) {
     std::printf("l1_l2_coherence test: FAILED (%d fallo(s))\n", fails);
