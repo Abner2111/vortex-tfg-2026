@@ -141,8 +141,14 @@ tex_PKG  = $(RTL_DIR)/tex/VX_tex_pkg.sv
 top_PRJ := VX_afu_wrap
 top_IP  := 1
 top_EXT := 1
+# TFG: tfg_cluster.sv (Vortex.sv, behind `ifdef TFG_USE_CUSTOM_CLUSTER) pulls in
+# l1_cache.sv/l2_cache.sv/snoop_bus.sv -- not on the include path above, so
+# Vivado/Verilator can't find them unless this flag is set (same fix as
+# sim/rtlsim/Makefile's RTL_INCLUDE).
 top_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache \
-           -I$(RTL_DIR)/cp -I$(AFU_DIR) -I$(AFU_COMMON_DIR) $(FPU_INC)
+           -I$(RTL_DIR)/cp -I$(AFU_DIR) -I$(AFU_COMMON_DIR) $(FPU_INC) \
+           $(if $(filter -DTFG_USE_CUSTOM_CLUSTER,$(XCONFIGS)),-I$(RTL_DIR)/tfg_l1 -I$(RTL_DIR)/tfg_l2) \
+           $(if $(filter -DTFG_USE_BASELINE_CLUSTER,$(XCONFIGS)),-I$(RTL_DIR)/tfg_l2)
 
 unittest_PRJ := Unittest
 unittest_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INC)
@@ -158,4 +164,8 @@ vm_PKG  = $(RTL_DIR)/vm/VX_tlb_pkg.sv
 vortex_PRJ := Vortex
 vortex_IP  := 1
 vortex_EXT := 1
-vortex_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INC)
+# TFG: same gap/fix as top_INC above -- tfg_cluster.sv needs these two paths
+# whenever TFG_USE_CUSTOM_CLUSTER is set.
+vortex_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INC) \
+              $(if $(filter -DTFG_USE_CUSTOM_CLUSTER,$(XCONFIGS)),-I$(RTL_DIR)/tfg_l1 -I$(RTL_DIR)/tfg_l2) \
+              $(if $(filter -DTFG_USE_BASELINE_CLUSTER,$(XCONFIGS)),-I$(RTL_DIR)/tfg_l2)
