@@ -63,6 +63,12 @@ RTL_INCLUDE = -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SRC_DIR) -I$(RTL_DIR) -I$(DP
 ifneq (,$(filter -DTFG_USE_CUSTOM_CLUSTER, $(CONFIGS)))
 	RTL_INCLUDE += -I$(RTL_DIR)/tfg_l1 -I$(RTL_DIR)/tfg_l2
 endif
+# TFG: tfg_cluster_baseline.sv (Vortex.sv, behind `ifdef TFG_USE_BASELINE_CLUSTER)
+# -- round-robin-only comparison baseline, no l1_cache.sv/snoop_bus.sv, but
+# still lives under tfg_l2 (same discovery gap as above).
+ifneq (,$(filter -DTFG_USE_BASELINE_CLUSTER, $(CONFIGS)))
+	RTL_INCLUDE += -I$(RTL_DIR)/tfg_l2
+endif
 
 # Add TCU extension sources
 ifneq (,$(filter -DVX_CFG_EXT_TCU_ENABLE, $(XCONFIGS)))

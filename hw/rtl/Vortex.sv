@@ -287,6 +287,42 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
 
             .busy       (per_cluster_busy[cluster_id])
         );
+`elsif TFG_USE_BASELINE_CLUSTER
+        // tfg_cluster_baseline.sv (TFG): mismo contrato y mismas
+        // restricciones que tfg_cluster.sv arriba, pero sin
+        // l1_cache.sv/snoop_bus.sv/l2_cache.sv -- cada núcleo accede
+        // memoria directo vía un árbitro round-robin real, sin ningún
+        // nivel de caché/coherencia. Baseline de comparación de
+        // ciclos/IPC contra tfg_cluster.sv a la misma config, no un
+        // reemplazo pensado para quedarse -- mutuamente excluyente con
+        // TFG_USE_CUSTOM_CLUSTER (`elsif, no `ifdef anidado).
+        `STATIC_ASSERT (`VX_CFG_NUM_CLUSTERS == 1,
+            ("TFG_USE_BASELINE_CLUSTER: tfg_cluster_baseline.sv solo soporta VX_CFG_NUM_CLUSTERS==1"))
+    `ifdef PERF_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_BASELINE_CLUSTER: tfg_cluster_baseline.sv no soporta PERF_ENABLE"))
+    `endif
+    `ifdef VX_CFG_EXT_RASTER_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_BASELINE_CLUSTER: tfg_cluster_baseline.sv no soporta VX_CFG_EXT_RASTER_ENABLE"))
+    `endif
+    `ifdef VX_CFG_VM_ENABLE
+        `STATIC_ASSERT (0, ("TFG_USE_BASELINE_CLUSTER: tfg_cluster_baseline.sv no soporta VX_CFG_VM_ENABLE"))
+    `endif
+
+        tfg_cluster_baseline #(
+            .CLUSTER_ID  (cluster_id),
+            .INSTANCE_ID (`SFORMATF(("cluster%0d", cluster_id)))
+        ) cluster (
+            .clk        (clk),
+            .reset      (reset),
+
+            .dcr_bus_if (per_cluster_dcr_bus_if[cluster_id]),
+
+            .mem_bus_if (per_cluster_mem_bus_if[cluster_id * L2_MEM_PORTS +: L2_MEM_PORTS]),
+
+            .kmu_bus_if (per_cluster_kmu_bus_if[cluster_id +: 1]),
+
+            .busy       (per_cluster_busy[cluster_id])
+        );
 `else
         VX_cluster #(
             .CLUSTER_ID (cluster_id),
