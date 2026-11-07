@@ -302,7 +302,14 @@ module tfg_cluster import VX_gpu_pkg::*; #(
         .DATA_SIZE   (TFG_L1_LINE_SIZE),
         .TAG_WIDTH   (TFG_MEM_TAG_WIDTH),
         .TAG_SEL_IDX (0),
-        .ARBITER     ("P")  // icache primero, igual que VX_socket.sv
+        .ARBITER     ("P"),  // icache primero, igual que VX_socket.sv
+        // Registra la frontera externa de este cluster (mem_bus_if de
+        // salida) -- mismo REQ_OUT_BUF/RSP_OUT_BUF que VX_socket.sv usa en
+        // su propia fusion icache+dcache (VX_socket.sv:776-777). Sin esto,
+        // xilinx_interface_check.tcl (MODULE-IFCHECK, empaquetado de
+        // kernel Vitis/xrt) falla: la frontera quedaba sin registrar.
+        .REQ_OUT_BUF (3),
+        .RSP_OUT_BUF (3)
     ) final_arb (
         .clk        (clk),
         .reset      (reset),

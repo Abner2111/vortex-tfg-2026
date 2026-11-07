@@ -74,7 +74,16 @@ proc mic_child_modules {cont} {
     set out {}
     foreach c [get_cells -quiet ${cont}/* -filter {IS_PRIMITIVE == false}] {
         set ref [get_property -quiet REF_NAME $c]
-        if {[regexp {^(VX_|Vortex)} $ref]} {
+        # TFG: tfg_cluster/tfg_cluster_baseline reemplazan a VX_cluster
+        # (hw/rtl/tfg_l2/, detras de `ifdef TFG_USE_CUSTOM_CLUSTER`/
+        # `TFG_USE_BASELINE_CLUSTER` en Vortex.sv) pero no matchean el
+        # prefijo VX_/Vortex -- sin este match quedan tratados como wrapper
+        # de generate transparente, y la recursion sigue hacia ADENTRO de
+        # toda su jerarquia interna (cada l1_cache, snoop_bus, etc.),
+        # chequeando miles de cruces internos que este chequeo nunca penso
+        # evaluar individualmente. Tratarlos como hoja real, igual que
+        # VX_cluster, detiene la recursion en su propia frontera externa.
+        if {[regexp {^(VX_|Vortex|tfg_cluster)} $ref]} {
             lappend out $c
         } else {
             foreach s [mic_child_modules $c] { lappend out $s }
