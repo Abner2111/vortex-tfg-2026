@@ -107,6 +107,14 @@ ifneq (,$(filter -DVX_CFG_FPU_TYPE_FPNEW, $(XCONFIGS)))
 endif
 RTL_INCLUDE = -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(RTL_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(AFU_DIR) -I$(AFU_COMMON_DIR)
 RTL_INCLUDE += $(FPU_INCLUDE)
+# TFG: tfg_cluster.sv (Vortex.sv, behind `ifdef TFG_USE_CUSTOM_CLUSTER) pulls in
+# l1_cache.sv/l2_cache.sv/snoop_bus.sv -- not on the include path above, so
+# this flow can't find them unless this is set. Same gap/fix as
+# sim/rtlsim/Makefile and hw/syn/xilinx/dut/catalog.mk; filters against the
+# raw CONFIGS, not XCONFIGS -- gen_config.py's --cflags resolution silently
+# drops macros it doesn't recognize from VX_config.toml's schema.
+RTL_INCLUDE += $(if $(filter -DTFG_USE_CUSTOM_CLUSTER,$(CONFIGS)),-I$(RTL_DIR)/tfg_l1 -I$(RTL_DIR)/tfg_l2)
+RTL_INCLUDE += $(if $(filter -DTFG_USE_BASELINE_CLUSTER,$(CONFIGS)),-I$(RTL_DIR)/tfg_l2)
 
 # Command Processor sources. RTL_PKGS holds packages only; the CP
 # interface files are auto-discovered via the -I path below.
