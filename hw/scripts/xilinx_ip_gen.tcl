@@ -48,4 +48,11 @@ set_property -dict [list CONFIG.Operation_Type {Add_Subtract} CONFIG.A_Precision
 
 generate_target all [get_ips]
 
+# Out-of-context synthesis, run explicitly rather than relying on
+# generate_target to produce it as a side effect: this is what actually
+# writes each IP's <name>_stub.v black-box placeholder that
+# xilinx_elab_check.tcl globs for. Whether generate_target alone also
+# produces a stub is IP-catalog/default-part dependent across Vivado
+# installs; synth_ip makes the stub's presence deterministic everywhere.
+
 close_project -delete
