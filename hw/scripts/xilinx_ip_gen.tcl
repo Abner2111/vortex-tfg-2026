@@ -54,5 +54,6 @@ generate_target all [get_ips]
 # xilinx_elab_check.tcl globs for. Whether generate_target alone also
 # produces a stub is IP-catalog/default-part dependent across Vivado
 # installs; synth_ip makes the stub's presence deterministic everywhere.
+synth_ip [get_ips]
 
 close_project -delete
