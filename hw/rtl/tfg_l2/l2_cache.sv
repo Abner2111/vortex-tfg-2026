@@ -530,7 +530,15 @@ module l2_cache import VX_gpu_pkg::*; #(
         logic [LINE_BITS-1:0] data_rd_data [NUM_WAYS];
 
         for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
-            logic [LINE_BITS-1:0] mem [NUM_SETS];
+            // 1 write + 1 read -- ya es el idioma que Vivado infiere como
+            // BRAM. Lo que lo frenaba es `NUM_SETS` (TFG_L2_BANK_SIZE/A-14):
+            // con el LINE_SIZE real da sets=4, tan chico que el heurístico
+            // de costo de Vivado prefiere flip-flops antes que gastar un
+            // bloque de 36Kb en unos pocos cientos de bits reales.
+            // `ram_style="block"` fuerza la BRAM igual -- subutilizada, pero
+            // irrelevante (nunca es el recurso escaso) frente a ahorrar los
+            // FF/LUT que hoy se van a esto.
+            (* ram_style = "block" *) logic [LINE_BITS-1:0] mem [NUM_SETS];
             wire wr_en = fsm_data_wr_en && (fsm_data_wr_way == w[WAY_BITS-1:0]);
             always_ff @(posedge clk) begin
                 if (wr_en)

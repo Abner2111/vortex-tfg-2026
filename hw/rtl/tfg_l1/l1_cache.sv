@@ -258,7 +258,20 @@ module l1_cache import VX_gpu_pkg::*; #(
     wire [SET_BITS-1:0] snoop_array_set_addr = (snp_state == SNP_IDLE) ? snoop_set : snoop_set_r;
 
     for (genvar w = 0; w < NUM_WAYS; ++w) begin : g_data_way
-        logic [LINE_BITS-1:0] mem [NUM_SETS];
+        // Dos copias espejadas (mismo wr_en/wr_data en las dos, siempre) en
+        // vez de un solo `mem[]` leído por dos puertos independientes: una
+        // BRAM física solo da 2 puertos en total (dual-port real), y acá
+        // hacían falta 3 accesos por ciclo (1 write + 2 reads
+        // independientes: data_rd_data del camino local, snoop_rd_data del
+        // camino de snoop). Con un `mem[]` único, Vivado nunca infiere BRAM
+        // para ninguno de los dos — cae a flip-flops. Separado en dos
+        // arrays, cada uno vuelve a ser el idioma estándar 1 write + 1 read
+        // que sí infiere, a costa de duplicar el almacenamiento de datos
+        // (irrelevante en BRAM del U55C, nunca es el recurso escaso de este
+        // diseño). `ram_style="block"` fuerza la inferencia explícitamente
+        // en vez de depender de que el heurístico de Vivado lo detecte solo.
+        (* ram_style = "block" *) logic [LINE_BITS-1:0] mem_local  [NUM_SETS];
+        (* ram_style = "block" *) logic [LINE_BITS-1:0] mem_snoop  [NUM_SETS];
 
         // Bypass de snoop_rd_data: si ESTE ciclo un write-hit local
         // (fsm_data_wr_en) cae en el mismo set que necesita el puerto de
@@ -282,10 +295,12 @@ module l1_cache import VX_gpu_pkg::*; #(
         wire snoop_rd_bypass = data_wr_en[w] && (data_wr_set[w] == snoop_array_set_addr);
 
         always_ff @(posedge clk) begin
-            if (data_wr_en[w])
-                mem[data_wr_set[w]] <= data_wr_data[w];
-            data_rd_data[w]  <= mem[array_set_addr];
-            snoop_rd_data[w] <= snoop_rd_bypass ? data_wr_data[w] : mem[snoop_array_set_addr];
+            if (data_wr_en[w]) begin
+                mem_local[data_wr_set[w]] <= data_wr_data[w];
+                mem_snoop[data_wr_set[w]] <= data_wr_data[w];
+            end
+            data_rd_data[w]  <= mem_local[array_set_addr];
+            snoop_rd_data[w] <= snoop_rd_bypass ? data_wr_data[w] : mem_snoop[snoop_array_set_addr];
         end
     end
 

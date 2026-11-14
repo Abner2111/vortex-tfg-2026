@@ -303,11 +303,14 @@ module compute_unit import VX_gpu_pkg::*; #(
                 if (tfg_l1.tag_array[0][w].valid && (tfg_l1.tag_array[0][w].tag == 2)) begin
                     dst_found_w = 1'b1;
                     dst_dirty_w = tfg_l1.tag_array[0][w].dirty;
+                    // mem_local (no mem_snoop): mismo dato en las dos
+                    // copias espejadas, es la misma que alimenta el
+                    // camino local de este debug peek.
                     case (w)
-                        0: dst_word0_w = tfg_l1.g_data_way[0].mem[0][63:0];
-                        1: dst_word0_w = tfg_l1.g_data_way[1].mem[0][63:0];
-                        2: dst_word0_w = tfg_l1.g_data_way[2].mem[0][63:0];
-                        default: dst_word0_w = tfg_l1.g_data_way[3].mem[0][63:0];
+                        0: dst_word0_w = tfg_l1.g_data_way[0].mem_local[0][63:0];
+                        1: dst_word0_w = tfg_l1.g_data_way[1].mem_local[0][63:0];
+                        2: dst_word0_w = tfg_l1.g_data_way[2].mem_local[0][63:0];
+                        default: dst_word0_w = tfg_l1.g_data_way[3].mem_local[0][63:0];
                     endcase
                 end
             end

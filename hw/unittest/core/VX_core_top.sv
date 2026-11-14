@@ -403,9 +403,9 @@ module VX_core_top import VX_gpu_pkg::*;
         assign dbg_dst_way_match[w] = tfg_l1.tag_array[0][w].valid
                                     && (tfg_l1.tag_array[0][w].tag == 2);
     end
-    assign dbg_dst_way0_word0 = tfg_l1.g_data_way[0].mem[0][63:0];
-    assign dbg_dst_way1_word0 = tfg_l1.g_data_way[1].mem[0][63:0];
-    assign dbg_dst_way2_word0 = tfg_l1.g_data_way[2].mem[0][63:0];
-    assign dbg_dst_way3_word0 = tfg_l1.g_data_way[3].mem[0][63:0];
+    assign dbg_dst_way0_word0 = tfg_l1.g_data_way[0].mem_local[0][63:0];
+    assign dbg_dst_way1_word0 = tfg_l1.g_data_way[1].mem_local[0][63:0];
+    assign dbg_dst_way2_word0 = tfg_l1.g_data_way[2].mem_local[0][63:0];
+    assign dbg_dst_way3_word0 = tfg_l1.g_data_way[3].mem_local[0][63:0];
 
 endmodule
