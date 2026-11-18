@@ -37,6 +37,31 @@ if { [info exists ::env(VORTEX_SLR)] } {
   }
 }
 
+# Platform HBM fan-out crossbar SLR confinement. Unset by default. HBM on the
+# U55C lives entirely in SLR0 (UG1120/UG1393 -- there is no HBM connectivity
+# on SLR1/SLR2), so once the kernel is itself confined to SLR0 the whole
+# kernel<->HBM path has no architectural need to leave SLR0. But axi_data_sc
+# (the platform-generated fan-out connecting our single merged AXI master to
+# the HBM[0:N] range from platforms.mk) is a sibling of the kernel cell under
+# "ulp", not inside the kernel's own pblock -- VORTEX_SLR alone leaves it
+# free for the SSI partitioner to spread anyway. Confine it too.
+if { [info exists ::env(VORTEX_PLATFORM_SLR)] } {
+  set vx_pslr $::env(VORTEX_PLATFORM_SLR)
+  set vx_xbar [get_cells -quiet -hierarchical -filter {NAME =~ "*axi_data_sc/inst" && IS_PRIMITIVE == 0}]
+  if { [llength $vx_xbar] == 0 } {
+    puts "CRITICAL WARNING: \[VORTEX\] axi_data_sc cell not found; cannot confine to ${vx_pslr}"
+  } else {
+    set vx_xbar [lindex $vx_xbar 0]
+    set vx_pb pblock_platform_xbar
+    if { [llength [get_pblocks -quiet $vx_pb]] == 0 } {
+      create_pblock $vx_pb
+    }
+    add_cells_to_pblock $vx_pb $vx_xbar
+    resize_pblock $vx_pb -add $vx_pslr
+    puts "INFO: \[VORTEX\] platform crossbar [get_property NAME $vx_xbar] confined to ${vx_pslr}"
+  }
+}
+
 # Kernel clock constraint verification/repair.
 # vpl's write_user_impl_clock_constraint derives the kernel generated-clock
 # ratio from the clk_wizard solver; when the solver silently fails it emits a

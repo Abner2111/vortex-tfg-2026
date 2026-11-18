@@ -22,14 +22,17 @@ ifneq ($(findstring xilinx_u55c,$(XSA)),)
   # 16 GB of HBM2 with 32 channels (512 MB per channel)
   CONFIGS += -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=32 -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=34
   CONFIGS += -DPLATFORM_MERGED_MEMORY_INTERFACE
-  # HBM[0:3] (4 canales) solo, sin VORTEX_SLR: no funcionó (intento 7).
-  # VORTEX_SLR=SLR0/SLR1 solo, con HBM[0:31]: tampoco (intentos 8-9) --
-  # el conflicto es puramente del crossbar axi_data_sc en los dos casos,
-  # sin ningún net de tfg_l1. Combinando ambos ejes ahora (intento 10,
-  # docs/proposals/tfg_resultados.md §4.2.4): menos canales reduce el
-  # crossbar, VORTEX_SLR=SLR0 co-ubica el kernel con el controlador HBM.
-  VPP_FLAGS += --connectivity.sp vortex_afu_1.m_axi_mem_0:HBM[0:3]
-  #VPP_FLAGS += --connectivity.sp vortex_afu_1.m_axi_mem_0:HBM[0:31]
+  # HBM[0:3] solo (intento 7) y VORTEX_SLR=SLR0/SLR1 solo (intentos 8-9):
+  # no funcionaron por separado. Combinados (intento 10): tampoco -- y
+  # peor, reintrodujo el conflicto de tfg_l1 que SLR0 solo ya había
+  # eliminado. HBM vive entero en SLR0 en el U55C (UG1120/UG1393), así que
+  # reducir canales nunca tenía justificación geográfica -- vuelto a
+  # HBM[0:31]. Intento 11 (docs/proposals/tfg_resultados.md §4.2.4):
+  # VORTEX_SLR=SLR0 + VORTEX_PLATFORM_SLR=SLR0 (pblock manual sobre el
+  # propio crossbar axi_data_sc, ver pre_opt_hook.tcl), sobre la base
+  # limpia del intento 9.
+  VPP_FLAGS += --connectivity.sp vortex_afu_1.m_axi_mem_0:HBM[0:31]
+  #VPP_FLAGS += --connectivity.sp vortex_afu_1.m_axi_mem_0:HBM[0:3]
   #VPP_FLAGS += $(foreach i,$(shell seq 0 31), --connectivity.sp vortex_afu_1.m_axi_mem_$(i):HBM[$(i)])
 else ifneq ($(findstring xilinx_u50,$(XSA)),)
   # 8 GB of HBM2 with 32 channels (256 MB per channel)
